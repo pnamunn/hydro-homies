@@ -188,6 +188,15 @@ void wifi_init_sta(void) {
 }
 
 
+
+// Init GPIO pin to provide a pump signal.
+void initPump(uint32_t pinNum) {
+    gpio_reset_pin(pinNum);   // enables pullup
+    gpio_set_direction(pinNum, GPIO_MODE_OUTPUT);
+    ESP_LOGI(GPIO, "Finish init GPIO pin %"PRIu32" to provide pump signal", pinNum);
+}
+
+
 void app_main(void)
 {
     // init NVS partition
@@ -200,13 +209,11 @@ void app_main(void)
 
     ESP_LOGI(STA, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
+
     time_t seconds_since_epoch;
     struct tm* current_time;
 
-    gpio_reset_pin(LED_GPIO);   // enables pullup
-    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-    ESP_LOGI(GPIO, "Init GPIO pin 5 to output");
-
+    initPump(LED_GPIO);
 
     while(1) {
         // sleep(10);
@@ -222,7 +229,6 @@ void app_main(void)
         uint32_t led_level = (current_time->tm_sec / 10) % 2;
         gpio_set_level(LED_GPIO, led_level);
         ESP_LOGI(GPIO, "Turning led to %"PRIu32"", led_level);
-
 
     }
 }
