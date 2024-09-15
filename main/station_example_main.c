@@ -32,6 +32,9 @@
 
 // GPIO menuconfigs
 #define LED_GPIO 5
+// 5 seconds
+#define WATER_DURATION  (5 * 1000) / portTICK_PERIOD_MS
+    // or use pdMS_TO_TICKS(5 * 1000)   ???
 
 
 #if CONFIG_ESP_WPA3_SAE_PWE_HUNT_AND_PECK
@@ -187,6 +190,27 @@ void wifi_init_sta(void) {
     ESP_LOGI(STA, "wifi_init_sta() finished.");
 }
 
+// Task to turn on pump for water duration & then turn off.
+void vWaterTask(void *pvParameters) {
+    ESP_LOGI(GPIO, "Starting vWaterTask()");
+
+    BaseType_t xEndTick = xTaskGetTickCount() + WATER_DURATION;
+    // turn on GPIO pin
+    gpio_set_level(LED_GPIO, 1);
+    // while(1) loop:
+        // check ticks
+        // if ticks = start + waterDuration, exit loop
+    // turn off GPIO pin
+    while(1) {
+        if(xTaskGetTickCount() == xEndTick) {
+            gpio_set_level(LED_GPIO, 0);
+            break;
+        }
+    }
+    ESP_LOGI(GPIO, "vWaterTask() finished");
+    vTaskDelete(NULL);  // task deletes itself
+}
+
 
 
 // Init GPIO pin to provide a pump signal.
@@ -197,7 +221,7 @@ void initPump(uint32_t pinNum) {
 }
 
 
-void app_main(void)
+void app_main(void) 
 {
     // init NVS partition
     esp_err_t nvs_return_handle = nvs_flash_init();
@@ -209,27 +233,44 @@ void app_main(void)
 
     ESP_LOGI(STA, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
+    
 
-    time_t seconds_since_epoch;
-    struct tm* current_time;
+    // esp_err_t status_handle = esp_wifi_get_mode(WIFI_MODE_STA);
+    // char* status_string[] = esp_err_to_name(status_handle);
+
+    // ESP_LOGI(STA, "Wifi should be on -> Status is: %s", status_string);
+    // ESP_ERROR_CHECK(esp_wifi_stop());
+
+    // time_t seconds_since_epoch;
+    // struct tm* current_time;
 
     initPump(LED_GPIO);
 
-    while(1) {
-        // sleep(10);
-        uint16_t delay_seconds = 10;
-        vTaskDelay((delay_seconds * 1000) / portTICK_PERIOD_MS);
-
-        seconds_since_epoch = time(NULL);
-        current_time = localtime(&seconds_since_epoch);
-        printf("Current time is:  %s", asctime(current_time));
-
-
-        // if the second's tens place is odd, turn led on; if even, turn led off
-        uint32_t led_level = (current_time->tm_sec / 10) % 2;
-        gpio_set_level(LED_GPIO, led_level);
-        ESP_LOGI(GPIO, "Turning led to %"PRIu32"", led_level);
-
+    BaseType_t taskCreateStatus = xTaskCreate(vWaterTask, "GPIO 5", 1000, NULL, 1, NULL);
+    if(taskCreateStatus == pdPASS) {
+        ESP_LOGI(GPIO, "vWaterTask() task creation for GPIO 5 successful");
     }
+
+    vTaskStartScheduler();
+
+    printf("ERROR:  vTaskStartSchedueler() exited");
+
+    // while(1) {
+        // sleep(10);
+        // uint16_t delay_seconds = 10;
+        // vTaskDelay((delay_seconds * 1000) / portTICK_PERIOD_MS);
+
+        // seconds_since_epoch = time(NULL);
+        // current_time = localtime(&seconds_since_epoch);
+        // printf("Current time is:  %s", asctime(current_time));
+
+
+    
+        // if the second's tens place is odd, turn led on; if even, turn led off
+        // uint32_t led_level = (current_time->tm_sec / 10) % 2;
+        // gpio_set_level(LED_GPIO, led_level);
+        // ESP_LOGI(GPIO, "Turning led to %"PRIu32"", led_level);
+
+    // }
 }
 
