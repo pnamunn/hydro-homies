@@ -212,6 +212,21 @@ void vWaterTask(void *pvParameters) {
 }
 
 
+// Task to print time every 10 seconds.
+void vPrintTimeTask(void *pvParameters) {
+    time_t seconds_since_epoch;
+    struct tm* current_time;
+    uint16_t delay_seconds = 10;
+
+    while(1) {
+        seconds_since_epoch = time(NULL);   // get current system time
+        current_time = localtime(&seconds_since_epoch);
+        printf("Current time is:  %s", asctime(current_time));
+        vTaskDelay(pdMS_TO_TICKS(delay_seconds * 1000));    // send task into blocked state for this long
+        // vTaskDelay((delay_seconds * 1000) / portTICK_PERIOD_MS);
+    }
+}
+
 
 // Init GPIO pin to provide a pump signal.
 void initPump(uint32_t pinNum) {
@@ -245,6 +260,11 @@ void app_main(void)
     // struct tm* current_time;
 
     initPump(LED_GPIO);
+
+    BaseType_t taskCreateStatus = xTaskCreate(vPrintTimeTask, "Print time", 1000, NULL, 1, NULL);
+    if(taskCreateStatus == pdPASS) {
+        ESP_LOGI(GPIO, "vPrintTimeTask() task creation successful");
+    }
 
     BaseType_t taskCreateStatus = xTaskCreate(vWaterTask, "GPIO 5", 1000, NULL, 1, NULL);
     if(taskCreateStatus == pdPASS) {
