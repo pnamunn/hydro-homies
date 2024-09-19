@@ -26,8 +26,6 @@
 #include "lwip/sys.h"
 
 // Wifi menuconfigs
-#define EXAMPLE_ESP_WIFI_SSID      "DALLEVIGNE-SKY"
-#define EXAMPLE_ESP_WIFI_PASS      "welcome2dallevigne"
 #define EXAMPLE_ESP_MAXIMUM_RETRY  4
 
 // GPIO menuconfigs
@@ -78,6 +76,15 @@ static const char* STA = "STA";
 static const char* NTP = "NTP";
 static const char* GPIO = "GPIO";
 static int retry_count = 0;
+
+
+typedef struct waterTaskParams_t {
+    uint8_t pin;
+    uint32_t durationSec;
+    struct tm scheduledTime;
+} waterTaskParams_t;
+
+struct waterTaskParams_t pin5WaterParams = {.pin = 5, .durationSec = 5};
 
 
 static void wifi_connection_events_handler
@@ -190,40 +197,42 @@ void wifi_init_sta(void) {
     ESP_LOGI(STA, "wifi_init_sta() finished.");
 }
 
-// Task to turn on pump for water duration & then turn off.
-void vWaterTask(void *pvParameters) {
-    ESP_LOGI(GPIO, "Starting vWaterTask()");
+// Task to turn on pump for water duration 5 sec, every 10 seconds.
+void vWaterTask(void* params) {
+    waterTaskParams_t* p = (waterTaskParams_t*) params;
 
-    BaseType_t xEndTick = xTaskGetTickCount() + WATER_DURATION;
-    // turn on GPIO pin
-    gpio_set_level(LED_GPIO, 1);
-    // while(1) loop:
-        // check ticks
-        // if ticks = start + waterDuration, exit loop
-    // turn off GPIO pin
     while(1) {
-        if(xTaskGetTickCount() == xEndTick) {
-            gpio_set_level(LED_GPIO, 0);
-            break;
-        }
+        gpio_set_level(p->pin, 1);
+        ESP_LOGI(GPIO, "pump %"PRIu8" ON", p->pin);
+
+        vTaskDelay(pdMS_TO_TICKS(p->durationSec * 1000));   // pump stays on for this long
+
+        gpio_set_level(p->pin, 0);
+        ESP_LOGI(GPIO, "pump %"PRIu8" OFF", p->pin);
+
+        vTaskDelay(pdMS_TO_TICKS(10000));   // temp; TODO change to a tm time
     }
-    ESP_LOGI(GPIO, "vWaterTask() finished");
-    vTaskDelete(NULL);  // task deletes itself
 }
 
 
-// Task to print time every 10 seconds.
-void vPrintTimeTask(void *pvParameters) {
-    time_t seconds_since_epoch;
-    struct tm* current_time;
-    uint16_t delay_seconds = 10;
+// Task to periodically print time.
+void vPrintTimeTask(void* periodSec) {
+    TickType_t* xPeriodMS = (TickType_t*) periodSec;
+    *xPeriodMS *= 1000;     // convert from sec to ms
+
+    time_t secondsSinceEpoch;
+    struct tm* localTime;
+    TickType_t xPrevWakeTime = xTaskGetTickCount();
+    int count = 0;
 
     while(1) {
-        seconds_since_epoch = time(NULL);   // get current system time
-        current_time = localtime(&seconds_since_epoch);
-        printf("Current time is:  %s", asctime(current_time));
-        vTaskDelay(pdMS_TO_TICKS(delay_seconds * 1000));    // send task into blocked state for this long
-        // vTaskDelay((delay_seconds * 1000) / portTICK_PERIOD_MS);
+        // secondsSinceEpoch = time(NULL);   // get current system time
+        // localTime = localtime(&secondsSinceEpoch);
+        // ESP_LOGI(NTP, "Current time is:  %s", asctime(localTime));
+        ++count;
+        ESP_LOGI(NTP, "%d", count);
+        // xTaskDelayUntil(&xPrevWakeTime, xPeriodMS);   // send task into blocked state for desired period
+        vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
 
@@ -232,6 +241,7 @@ void vPrintTimeTask(void *pvParameters) {
 void initPump(uint32_t pinNum) {
     gpio_reset_pin(pinNum);   // enables pullup
     gpio_set_direction(pinNum, GPIO_MODE_OUTPUT);
+    gpio_set_level(pinNum, 0);
     ESP_LOGI(GPIO, "Finish init GPIO pin %"PRIu32" to provide pump signal", pinNum);
 }
 
@@ -239,58 +249,43 @@ void initPump(uint32_t pinNum) {
 void app_main(void) 
 {
     // init NVS partition
-    esp_err_t nvs_return_handle = nvs_flash_init();
-    if (nvs_return_handle == ESP_ERR_NVS_NO_FREE_PAGES || nvs_return_handle == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-      ESP_ERROR_CHECK(nvs_flash_erase());
-      nvs_return_handle = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(nvs_return_handle);
+    // esp_err_t nvs_return_handle = nvs_flash_init();
+    // if (nvs_return_handle == ESP_ERR_NVS_NO_FREE_PAGES || nvs_return_handle == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    //   ESP_ERROR_CHECK(nvs_flash_erase());
+    //   nvs_return_handle = nvs_flash_init();
+    // }
+    // ESP_ERROR_CHECK(nvs_return_handle);
 
-    ESP_LOGI(STA, "ESP_WIFI_MODE_STA");
-    wifi_init_sta();
+    // ESP_LOGI(STA, "ESP_WIFI_MODE_STA");
+    // wifi_init_sta();
     
-
     // esp_err_t status_handle = esp_wifi_get_mode(WIFI_MODE_STA);
     // char* status_string[] = esp_err_to_name(status_handle);
 
     // ESP_LOGI(STA, "Wifi should be on -> Status is: %s", status_string);
     // ESP_ERROR_CHECK(esp_wifi_stop());
 
-    // time_t seconds_since_epoch;
-    // struct tm* current_time;
+    initPump(5);
 
-    initPump(LED_GPIO);
 
-    BaseType_t taskCreateStatus = xTaskCreate(vPrintTimeTask, "Print time", 1000, NULL, 1, NULL);
+    // Print Time Task
+    TickType_t* periodSecParam = malloc(sizeof(TickType_t));
+    *periodSecParam = 10;
+    BaseType_t taskCreateStatus = xTaskCreate(vPrintTimeTask, "Print time", 1024 * 4,
+                                              (void*) periodSecParam, 1, NULL);
     if(taskCreateStatus == pdPASS) {
         ESP_LOGI(GPIO, "vPrintTimeTask() task creation successful");
     }
 
-    BaseType_t taskCreateStatus = xTaskCreate(vWaterTask, "GPIO 5", 1000, NULL, 1, NULL);
+
+    // Water GPIO Task
+    taskCreateStatus = xTaskCreate(vWaterTask, "GPIO 5", 1024 * 4,
+                                   (void*) &pin5WaterParams, 1, NULL);
     if(taskCreateStatus == pdPASS) {
         ESP_LOGI(GPIO, "vWaterTask() task creation for GPIO 5 successful");
     }
 
-    vTaskStartScheduler();
 
-    printf("ERROR:  vTaskStartSchedueler() exited");
-
-    // while(1) {
-        // sleep(10);
-        // uint16_t delay_seconds = 10;
-        // vTaskDelay((delay_seconds * 1000) / portTICK_PERIOD_MS);
-
-        // seconds_since_epoch = time(NULL);
-        // current_time = localtime(&seconds_since_epoch);
-        // printf("Current time is:  %s", asctime(current_time));
-
-
-    
-        // if the second's tens place is odd, turn led on; if even, turn led off
-        // uint32_t led_level = (current_time->tm_sec / 10) % 2;
-        // gpio_set_level(LED_GPIO, led_level);
-        // ESP_LOGI(GPIO, "Turning led to %"PRIu32"", led_level);
-
-    // }
+    // esp idf's task.h API automatically runs vTaskStartScheduler() at end of app_main()
 }
 
