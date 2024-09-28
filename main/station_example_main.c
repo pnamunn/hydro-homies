@@ -26,6 +26,8 @@
 #include "lwip/sys.h"
 
 // Wifi menuconfigs
+#define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
+#define EXAMPLE_ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
 #define EXAMPLE_ESP_MAXIMUM_RETRY  4
 
 // GPIO menuconfigs
@@ -210,7 +212,6 @@ void vWaterTask(void* params) {
         gpio_set_level(p->pin, 0);
         ESP_LOGI(GPIO, "pump %"PRIu8" OFF", p->pin);
 
-        vTaskDelay(pdMS_TO_TICKS(10000));   // temp; TODO change to a tm time
     }
 }
 
@@ -223,16 +224,23 @@ void vPrintTimeTask(void* periodSec) {
     time_t secondsSinceEpoch;
     struct tm* localTime;
     TickType_t xPrevWakeTime = xTaskGetTickCount();
-    int count = 0;
+    // int count = 0;
+    BaseType_t xDelayUntilSuccess;
 
     while(1) {
-        // secondsSinceEpoch = time(NULL);   // get current system time
-        // localTime = localtime(&secondsSinceEpoch);
-        // ESP_LOGI(NTP, "Current time is:  %s", asctime(localTime));
-        ++count;
-        ESP_LOGI(NTP, "%d", count);
-        // xTaskDelayUntil(&xPrevWakeTime, xPeriodMS);   // send task into blocked state for desired period
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        secondsSinceEpoch = time(NULL);   // get current system time
+        localTime = localtime(&secondsSinceEpoch);
+        ESP_LOGI(NTP, "Current time is:  %s", asctime(localTime));
+        // ++count;
+        // ESP_LOGI(NTP, "%d", count);
+
+        // send task into blocked state for desired period
+        // vTaskDelay(pdMS_TO_TICKS(10000));
+        xDelayUntilSuccess = xTaskDelayUntil(&xPrevWakeTime,  pdMS_TO_TICKS(*xPeriodMS));
+        if(xDelayUntilSuccess == pdFALSE) {
+            ESP_LOGE(NTP, "Error:  vPrintTimeTask()'s xTaskDelayUntil was unsuccessful bc ???");
+        }
+
     }
 }
 
