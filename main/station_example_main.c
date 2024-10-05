@@ -1,12 +1,3 @@
-/* WiFi station Example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -17,11 +8,11 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <driver/gpio.h>
-
 #include "lwip/err.h"
 #include "lwip/sys.h"
 
@@ -29,13 +20,6 @@
 #define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
 #define EXAMPLE_ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
 #define EXAMPLE_ESP_MAXIMUM_RETRY  4
-
-// GPIO menuconfigs
-#define LED_GPIO 5
-// 5 seconds
-#define WATER_DURATION  (5 * 1000) / portTICK_PERIOD_MS
-    // or use pdMS_TO_TICKS(5 * 1000)   ???
-
 
 #if CONFIG_ESP_WPA3_SAE_PWE_HUNT_AND_PECK
 #define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_HUNT_AND_PECK
@@ -65,21 +49,18 @@
 #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WAPI_PSK
 #endif
 
-/* FreeRTOS event group to signal when we are connected*/
+#define WIFI_CONNECTED_BIT BIT0     // connected to AP & has an IP
+#define WIFI_FAIL_BIT      BIT1     // failed to connect
 static EventGroupHandle_t s_wifi_event_group;
-
-/* The event group allows multiple bits for each event, but we only care about two events:
- * - we are connected to the AP with an IP
- * - we failed to connect after the maximum amount of retries */
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
-
-static const char* STA = "STA";
-static const char* NTP = "NTP";
-static const char* GPIO = "GPIO";
 static int retry_count = 0;
 
 
+// Logging
+static const char* STA = "STA";
+static const char* NTP = "NTP";
+static const char* GPIO = "GPIO";
+
+// Global
 typedef struct waterTaskParams_t {
     uint8_t pin;
     uint32_t durationSec;
@@ -162,11 +143,6 @@ void wifi_init_sta(void) {
         .sta = {
             .ssid = EXAMPLE_ESP_WIFI_SSID,
             .password = EXAMPLE_ESP_WIFI_PASS,
-            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
-             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
-             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
-             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
-             */
             .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
             .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
             .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
@@ -178,19 +154,17 @@ void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_configs));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-     * number of re-tries (WIFI_FAIL_BIT). The bits are set by wifi_event_handler() (see above) */
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+    // Block until one of these events occurs
+    EventBits_t wifiEventBits = xEventGroupWaitBits(s_wifi_event_group,
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
             pdFALSE,
             pdFALSE,
             portMAX_DELAY);
 
-    /* xEventGroupWaitBits() returns the bits before the call returned,
-    hence we can test which event actually happened. */
-    if (bits & WIFI_CONNECTED_BIT) {
+    // react to the event that occurred
+    if (wifiEventBits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(STA, "Successfully connected to AP SSID: %s", EXAMPLE_ESP_WIFI_SSID);
-    } else if (bits & WIFI_FAIL_BIT) {
+    } else if (wifiEventBits & WIFI_FAIL_BIT) {
         ESP_LOGI(STA, "Failed to connect to SSID: %s", EXAMPLE_ESP_WIFI_SSID);
     } else {
         ESP_LOGE(STA, "Unexpected error occured when attempting to connect to SSDI: %s", EXAMPLE_ESP_WIFI_SSID);
@@ -234,8 +208,7 @@ void vPrintTimeTask(void* periodSec) {
         // ++count;
         // ESP_LOGI(NTP, "%d", count);
 
-        // send task into blocked state for desired period
-        // vTaskDelay(pdMS_TO_TICKS(10000));
+        // block task for desired period
         xDelayUntilSuccess = xTaskDelayUntil(&xPrevWakeTime,  pdMS_TO_TICKS(*xPeriodMS));
         if(xDelayUntilSuccess == pdFALSE) {
             ESP_LOGE(NTP, "Error:  vPrintTimeTask()'s xTaskDelayUntil was unsuccessful bc ???");
@@ -257,15 +230,15 @@ void initPump(uint32_t pinNum) {
 void app_main(void) 
 {
     // init NVS partition
-    // esp_err_t nvs_return_handle = nvs_flash_init();
-    // if (nvs_return_handle == ESP_ERR_NVS_NO_FREE_PAGES || nvs_return_handle == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    //   ESP_ERROR_CHECK(nvs_flash_erase());
-    //   nvs_return_handle = nvs_flash_init();
-    // }
-    // ESP_ERROR_CHECK(nvs_return_handle);
+    esp_err_t nvs_return_handle = nvs_flash_init();
+    if (nvs_return_handle == ESP_ERR_NVS_NO_FREE_PAGES || nvs_return_handle == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      nvs_return_handle = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_return_handle);
 
-    // ESP_LOGI(STA, "ESP_WIFI_MODE_STA");
-    // wifi_init_sta();
+    ESP_LOGI(STA, "ESP_WIFI_MODE_STA");
+    wifi_init_sta();
     
     // esp_err_t status_handle = esp_wifi_get_mode(WIFI_MODE_STA);
     // char* status_string[] = esp_err_to_name(status_handle);
