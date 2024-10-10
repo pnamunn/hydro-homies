@@ -96,25 +96,11 @@ static void wifi_connection_events_handler
 }
 
 
-void wifi_init_sta(void) {
+void init_wifi_STA(void) {
     s_wifi_event_group = xEventGroupCreate();
 
     // use NETIF lib for application layer abstraction & thread safety
     ESP_ERROR_CHECK(esp_netif_init());
-
-    // choose server & start service
-    char ntp_server_address[] = "pool.ntp.org";
-    esp_sntp_config_t sntp_configs = ESP_NETIF_SNTP_DEFAULT_CONFIG(ntp_server_address);
-    ESP_ERROR_CHECK(esp_netif_sntp_init(&sntp_configs));
-    ESP_LOGI(NTP, "Service started from %s", ntp_server_address);
-
-    // set PST timezone
-    char timezone[] = "PST8PDT";
-    setenv("TZ", timezone, 1);     // change timezone env variable
-    tzset();    // set runtime timezone to TZ env variable (auto checks daylight savings)
-    ESP_LOGI(NTP, "Timezone set to %s", timezone);
-
-
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
@@ -125,7 +111,6 @@ void wifi_init_sta(void) {
     // handler events
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
-
     // handler check if got wifi ID data
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
@@ -139,6 +124,8 @@ void wifi_init_sta(void) {
                                                         NULL,
                                                         &instance_got_ip));
 
+
+    // set sta mode, configs, & start wifi
     wifi_config_t sta_configs = {
         .sta = {
             .ssid = EXAMPLE_ESP_WIFI_SSID,
@@ -148,8 +135,6 @@ void wifi_init_sta(void) {
             .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
         },
     };
-
-    // set sta mode, configs, & start wifi
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_configs));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -169,9 +154,24 @@ void wifi_init_sta(void) {
     } else {
         ESP_LOGE(STA, "Unexpected error occured when attempting to connect to SSDI: %s", EXAMPLE_ESP_WIFI_SSID);
     }
-
-    ESP_LOGI(STA, "wifi_init_sta() finished.");
 }
+
+
+void init_SNTP() {
+    // set PST timezone
+    char timezone[] = "PST8PDT";
+    setenv("TZ", timezone, 1);     // change timezone env variable
+    tzset();    // set runtime timezone to TZ env variable (auto checks daylight savings)
+    ESP_LOGI(NTP, "Timezone set to %s", timezone);
+
+    // choose server, init SNTP, & start service
+    char ntp_server_address[] = "pool.ntp.org";
+    esp_sntp_config_t sntp_configs = ESP_NETIF_SNTP_DEFAULT_CONFIG(ntp_server_address);
+    ESP_ERROR_CHECK(esp_netif_sntp_init(&sntp_configs));    // also auto-starts trying to achieve SNTP service
+    ESP_ERROR_CHECK(esp_netif_sntp_sync_wait(pdMS_TO_TICKS(15000))); // give 15 secs to attempt to connect to service
+    ESP_LOGI(NTP, "Synced to SNTP service %s successfully!", ntp_server_address);
+}
+
 
 // Task to turn on pump for water duration 5 sec, every 10 seconds.
 void vWaterTask(void* params) {
@@ -205,6 +205,8 @@ void vPrintTimeTask(void* periodSec) {
         secondsSinceEpoch = time(NULL);   // get current system time
         localTime = localtime(&secondsSinceEpoch);
         ESP_LOGI(NTP, "Current time is:  %s", asctime(localTime));
+        ESP_LOGI(NTP, "Secs since epoch:  %ld", (long)secondsSinceEpoch);
+
         // ++count;
         // ESP_LOGI(NTP, "%d", count);
 
@@ -237,8 +239,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_return_handle);
 
-    ESP_LOGI(STA, "ESP_WIFI_MODE_STA");
-    wifi_init_sta();
+
+    init_wifi_STA();
+    init_SNTP();
     
     // esp_err_t status_handle = esp_wifi_get_mode(WIFI_MODE_STA);
     // char* status_string[] = esp_err_to_name(status_handle);
