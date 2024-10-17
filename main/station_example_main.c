@@ -176,38 +176,28 @@ void init_SNTP() {
 }
 
 
-// Task to turn on pump for water duration 5 sec, every 10 seconds.
+// Init GPIO pin to provide a pump signal.
+void initPump(uint32_t pinNum) {
+    gpio_reset_pin(pinNum);   // enables pullup
+    gpio_set_direction(pinNum, GPIO_MODE_OUTPUT);
+    gpio_set_level(pinNum, 0);
+    ESP_LOGI(GPIO, "Finish init GPIO pin %"PRIu32" to provide pump signal", pinNum);
+}
+
+// Shows if there's a time of day delta, to min accuracy.
+bool isTimeOfDayDelta(struct tm scheduledTime) {
+    return ((scheduledTime.tm_hour - localTime->tm_hour) +
+           (scheduledTime.tm_min - localTime->tm_min));
+}
+
 void vWaterTask(void* params) {
     waterTaskParams_t* p = (waterTaskParams_t*) params;
-    int secDelta;
-    int timeDelta;
-
     TickType_t xPrevWakeTime = xTaskGetTickCount();
     BaseType_t xDelayUntilSuccess;
 
     while(1) {
-        // gpio_set_level(p->pin, 1);
-        // ESP_LOGI(GPIO, "pump %"PRIu8" ON", p->pin);
 
-        // vTaskDelay(pdMS_TO_TICKS(p->durationSec * 1000));   // pump stays on for this long
-
-        // gpio_set_level(p->pin, 0);
-        // ESP_LOGI(GPIO, "pump %"PRIu8" OFF", p->pin);
-
-
-
-        // vTaskDelay(pdMS_TO_TICKS(60 * 1000));   // every min
-        // xPrevWakeTime = xTaskGetTickCount();
-
-        timeDelta = p->scheduledTime.tm_min - localTime->tm_min;
-        if (timeDelta == 0) {
-            secDelta = p->scheduledTime.tm_sec - localTime->tm_sec;
-            
-            xDelayUntilSuccess = xTaskDelayUntil(&xPrevWakeTime,  pdMS_TO_TICKS(secDelta * 1000));
-            if(xDelayUntilSuccess == pdFALSE) {
-                ESP_LOGE(NTP, "Error:  vWaterTask()'s xTaskDelayUntil was unsuccessful bc ???");
-            }
-
+        if (!isTimeOfDayDelta(p->scheduledTime)) {
             gpio_set_level(p->pin, 1);
             ESP_LOGI(GPIO, "IT'S WATER TIME.");
             ESP_LOGI(GPIO, "Current time: %s", asctime(localTime));
@@ -215,13 +205,13 @@ void vWaterTask(void* params) {
 
             vTaskDelay(pdMS_TO_TICKS(p->durationSec * 1000));   // pump stays on for this long
             gpio_set_level(p->pin, 0);
+            ESP_LOGI(GPIO, "Water time done.");
         }
 
-        // vTaskDelay(pdMS_TO_TICKS(60 * 1000));
         xDelayUntilSuccess = xTaskDelayUntil(&xPrevWakeTime,  pdMS_TO_TICKS(10 * 1000));    // every 10 sec
-        
-
-
+        if(xDelayUntilSuccess == pdFALSE) {
+                ESP_LOGE(NTP, "Error:  vWaterTask()'s xTaskDelayUntil was unsuccessful bc ???");
+        }
     }
 }
 
