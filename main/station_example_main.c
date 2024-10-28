@@ -188,6 +188,16 @@ void initPump(uint32_t pinNum) {
 bool isTimeOfDayDelta(struct tm scheduledTime) {
     return ((scheduledTime.tm_hour - localTime->tm_hour) +
            (scheduledTime.tm_min - localTime->tm_min));
+// Shows if scheduled time & local time match, to min accuracy.
+bool isTimeMatch(struct tm scheduledTime) {
+    if ((scheduledTime.tm_hour - localTime->tm_hour == 0) &&
+        (scheduledTime.tm_min - localTime->tm_min == 0)) {
+        return true;
+    }
+    else {
+        return false;
+    }
+}
 }
 
 void vWaterTask(void* params) {
@@ -198,6 +208,7 @@ void vWaterTask(void* params) {
     while(1) {
 
         if (!isTimeOfDayDelta(p->scheduledTime)) {
+        if (isTimeMatch(p->scheduledTime)) {  // if no delta
             gpio_set_level(p->pin, 1);
             ESP_LOGI(GPIO, "IT'S WATER TIME.");
             ESP_LOGI(GPIO, "Current time: %s", asctime(localTime));
