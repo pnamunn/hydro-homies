@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <driver/gpio.h>
+#include "driver/uart.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
 
@@ -59,9 +60,12 @@ static int retry_count = 0;
 static const char* STA = "STA";
 static const char* NTP = "NTP";
 static const char* GPIO = "GPIO";
+static const char* UART = "UART";
 
 // Globals
 struct tm* localTime;
+const uart_port_t uart_num = UART_NUM_0;
+const int RX_BUFFER_SIZE = 1024;
 
 typedef struct waterTaskParams_t {
     uint8_t pin;
@@ -69,8 +73,8 @@ typedef struct waterTaskParams_t {
     struct tm scheduledTime;
 } waterTaskParams_t;
 
-struct waterTaskParams_t pin5WaterParams = {.pin = 5, .durationSec = 5,
-                                            .scheduledTime.tm_hour = 21, .scheduledTime.tm_min = 33, .scheduledTime.tm_sec = 10};
+struct waterTaskParams_t pin3Parameters = {.pin = 3, .durationSec = 5,
+                                            .scheduledTime.tm_hour = 22, .scheduledTime.tm_min = 30, .scheduledTime.tm_sec = 10};
 
 
 static void wifi_connection_events_handler
@@ -184,10 +188,6 @@ void initPump(uint32_t pinNum) {
     ESP_LOGI(GPIO, "Finish init GPIO pin %"PRIu32" to provide pump signal", pinNum);
 }
 
-// Shows if there's a time of day delta, to min accuracy.
-bool isTimeOfDayDelta(struct tm scheduledTime) {
-    return ((scheduledTime.tm_hour - localTime->tm_hour) +
-           (scheduledTime.tm_min - localTime->tm_min));
 // Shows if scheduled time & local time match, to min accuracy.
 bool isTimeMatch(struct tm scheduledTime) {
     if ((scheduledTime.tm_hour - localTime->tm_hour == 0) &&
@@ -198,8 +198,57 @@ bool isTimeMatch(struct tm scheduledTime) {
         return false;
     }
 }
+
+
+void initUART() {
+    // set configs
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_config));
+
+    // choose which UART pin & helper pins to use
+    ESP_ERROR_CHECK(uart_set_pin(uart_num, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    
+    // install driver
+    // with Rx buffer, no Tx buffer (Tx is blocking)
+    ESP_ERROR_CHECK(uart_driver_install(uart_num, RX_BUFFER_SIZE*2, 0,
+                                        0, NULL, 0));
+    ESP_LOGI(UART, "UART initialized");
 }
 
+void vCheckForUserInput() {
+    ESP_LOGI(UART, "in CheckForUserInput()");
+    char* s = "To change scheduled water time, serial Tx 's'";
+    uart_write_bytes(uart_num, s, strlen(s));
+    
+    char* RxdData = (char*)malloc(RX_BUFFER_SIZE);
+    uint8_t RxedMsgLen = 0;
+
+    while(1) {
+        // if UART RX 's'
+        // ESP_ERROR_CHECK(uart_get_buffered_data_len(uart_num, (size_t*)&RxBufferLen));
+        RxedMsgLen = uart_read_bytes(uart_num, RxdData, 128, pdMS_TO_TICKS(5000));
+        // ESP_LOGI(UART, "RxBufferLen is %"PRIu8"", RxBufferLen);
+        
+        if(RxedMsgLen) {
+            RxdData[RxedMsgLen] = '\0';
+            ESP_LOGI(UART, "msg RECEIVED");
+            // scheduleWaterTime();
+            uart_flush();
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(7000));
+    }
+}
+
+// Task to turn on pump for water duration 5 sec at desired watering time.
 void vWaterTask(void* params) {
     waterTaskParams_t* p = (waterTaskParams_t*) params;
     TickType_t xPrevWakeTime = xTaskGetTickCount();
@@ -207,7 +256,6 @@ void vWaterTask(void* params) {
 
     while(1) {
 
-        if (!isTimeOfDayDelta(p->scheduledTime)) {
         if (isTimeMatch(p->scheduledTime)) {  // if no delta
             gpio_set_level(p->pin, 1);
             ESP_LOGI(GPIO, "IT'S WATER TIME.");
@@ -274,7 +322,7 @@ void app_main(void)
     // ESP_ERROR_CHECK(esp_wifi_stop());
 
     initPump(5);
-
+    initUART();
 
     // Print Time Task
     TickType_t* periodSecParam = malloc(sizeof(TickType_t));
@@ -285,12 +333,18 @@ void app_main(void)
         ESP_LOGI(GPIO, "vPrintTimeTask() task creation successful");
     }
 
-
     // Water GPIO Task
-    taskCreateStatus = xTaskCreate(vWaterTask, "GPIO 5", 1024 * 4,
-                                   (void*) &pin5WaterParams, 1, NULL);
+    taskCreateStatus = xTaskCreate(vWaterTask, "GPIO3", 1024 * 4,
+                                   (void*) &pin3Parameters, 1, NULL);
     if(taskCreateStatus == pdPASS) {
-        ESP_LOGI(GPIO, "vWaterTask() task creation for GPIO 5 successful");
+        ESP_LOGI(GPIO, "vWaterTask() task creation for GPIO3 successful");
+    }
+
+    // Check for user input task
+    taskCreateStatus = xTaskCreate(vCheckForUserInput, "User input", 1024 * 4,
+                                   NULL, 2, NULL);
+    if(taskCreateStatus == pdPASS) {
+        ESP_LOGI(GPIO, "vCheckForUserInput() task creation successful");
     }
 
 
