@@ -65,7 +65,8 @@ static const char* UART = "UART";
 // Globals
 struct tm* localTime;
 const uart_port_t uart_num = UART_NUM_0;
-const int RX_BUFFER_SIZE = 1024;
+#define RX_BUFFER_SIZE 1024
+char RxdData[RX_BUFFER_SIZE];
 
 typedef struct waterTaskParams_t {
     uint8_t pin;
@@ -223,28 +224,56 @@ void initUART() {
     ESP_LOGI(UART, "UART initialized");
 }
 
-void vCheckForUserInput() {
-    ESP_LOGI(UART, "in CheckForUserInput()");
-    char* s = "To change scheduled water time, serial Tx 's'";
-    uart_write_bytes(uart_num, s, strlen(s));
-    
-    char* RxdData = (char*)malloc(RX_BUFFER_SIZE);
-    uint8_t RxedMsgLen = 0;
+
+void vRxTask() {
+    uint8_t RxdMsgLen = 0;
+    uint8_t state = 0;
 
     while(1) {
-        // if UART RX 's'
-        // ESP_ERROR_CHECK(uart_get_buffered_data_len(uart_num, (size_t*)&RxBufferLen));
-        RxedMsgLen = uart_read_bytes(uart_num, RxdData, 128, pdMS_TO_TICKS(5000));
-        // ESP_LOGI(UART, "RxBufferLen is %"PRIu8"", RxBufferLen);
-        
-        if(RxedMsgLen) {
-            RxdData[RxedMsgLen] = '\0';
-            ESP_LOGI(UART, "msg RECEIVED");
-            // scheduleWaterTime();
-            uart_flush();
+        ESP_ERROR_CHECK(uart_get_buffered_data_len(uart_num,    // store length of data in RxdMsgLen
+                                                   (size_t*)&RxdMsgLen));
+        if(RxdMsgLen) {
+            uart_read_bytes(uart_num, RxdData, 20, pdMS_TO_TICKS(1000));
+            RxdData[RxdMsgLen] = '\0'; // add null character at end of data            
+            ESP_LOGI(UART, "you entered: %s", RxdData);
+
+            if(*RxdData == 's') {   // User chose to change water schedule time
+                state = 1;
+            }
+
+            switch(state) {
+                case 1: 
+                    ESP_LOGI(UART, "GIMME A PIN: ");
+                    state = 2;
+                    break;
+                case 2:
+                    // TODO set pin = data
+                    ESP_LOGI(UART, "GIMME A HR: ");
+                    state = 3;
+                    break;
+                case 3:
+                    // TODO set hr = data
+                    ESP_LOGI(UART, "GIMME A MIN: ");
+                    state = 4;
+                    break;
+                case 4:
+                    // TODO set min = data
+                    ESP_LOGI(UART, "All done changing scheduled time");
+                    state = 0;
+                    break;
+                default:
+                    state = 0;
+                    break;
+                case 0:
+                    break;
+            }
+
+            // reset RxdMsgLen, clear RxdData, flush ESP's UART Rx buffer
+            RxdMsgLen = 0;
+            RxdData[0] = '\0';
+            uart_flush(uart_num);
         }
-        
-        vTaskDelay(pdMS_TO_TICKS(7000));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
@@ -327,26 +356,25 @@ void app_main(void)
     // Print Time Task
     TickType_t* periodSecParam = malloc(sizeof(TickType_t));
     *periodSecParam = 10;
-    BaseType_t taskCreateStatus = xTaskCreate(vPrintTimeTask, "Print time", 1024 * 4,
+    BaseType_t taskCreateStatus = xTaskCreate(vPrintTimeTask, "Print time task", 1024 * 4,
                                               (void*) periodSecParam, 1, NULL);
     if(taskCreateStatus == pdPASS) {
         ESP_LOGI(GPIO, "vPrintTimeTask() task creation successful");
     }
 
     // Water GPIO Task
-    taskCreateStatus = xTaskCreate(vWaterTask, "GPIO3", 1024 * 4,
+    taskCreateStatus = xTaskCreate(vWaterTask, "GPIO3 task", 1024 * 4,
                                    (void*) &pin3Parameters, 1, NULL);
     if(taskCreateStatus == pdPASS) {
         ESP_LOGI(GPIO, "vWaterTask() task creation for GPIO3 successful");
     }
 
-    // Check for user input task
-    taskCreateStatus = xTaskCreate(vCheckForUserInput, "User input", 1024 * 4,
+    // UART Rx User Input Task
+    taskCreateStatus = xTaskCreate(vRxTask, "UART RX task", 1024 * 4,
                                    NULL, 2, NULL);
     if(taskCreateStatus == pdPASS) {
-        ESP_LOGI(GPIO, "vCheckForUserInput() task creation successful");
+        ESP_LOGI(GPIO, "vRxTask() task creation successful");
     }
-
 
     // esp idf's task.h API automatically runs vTaskStartScheduler() at end of app_main()
 }
