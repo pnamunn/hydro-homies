@@ -66,17 +66,28 @@ static const char* UART = "UART";
 struct tm* localTime;
 const uart_port_t uart_num = UART_NUM_0;
 #define RX_BUFFER_SIZE 1024
-char RxdData[RX_BUFFER_SIZE];
 
 typedef struct waterTaskParams_t {
     uint8_t pin;
-    uint32_t durationSec;
+    uint8_t durationSec;
     struct tm scheduledTime;
 } waterTaskParams_t;
 
 struct waterTaskParams_t pin3Parameters = {.pin = 3, .durationSec = 5,
                                             .scheduledTime.tm_hour = 22, .scheduledTime.tm_min = 30, .scheduledTime.tm_sec = 10};
 
+enum AskState {
+    DEFAULT,
+
+    // for 's' menu option
+    HOUR,
+    MIN,
+    CONFIRM_TIME,
+
+    // for 'd' menu option
+    DURATION,
+    CONFIRM_DURATION
+};
 
 static void wifi_connection_events_handler
             (void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
@@ -227,7 +238,11 @@ void initUART() {
 
 void vRxTask() {
     uint8_t RxdMsgLen = 0;
-    uint8_t state = 0;
+    char RxdData[RX_BUFFER_SIZE];
+    enum AskState state = DEFAULT;
+    // Tell menu options
+    ESP_LOGI(UART, "Enter 's' to change a scheduled time. \n \
+                    Enter 'd' to change a water duration.");
 
     while(1) {
         ESP_ERROR_CHECK(uart_get_buffered_data_len(uart_num,    // store length of data in RxdMsgLen
@@ -235,36 +250,69 @@ void vRxTask() {
         if(RxdMsgLen) {
             uart_read_bytes(uart_num, RxdData, 20, pdMS_TO_TICKS(1000));
             RxdData[RxdMsgLen] = '\0'; // add null character at end of data            
-            ESP_LOGI(UART, "you entered: %s", RxdData);
+            // ESP_LOGI(UART, "you entered: %s", RxdData);
 
-            if(*RxdData == 's') {   // User chose to change water schedule time
-                state = 1;
+            // Handle user's menu option input
+            if(*RxdData == 's') {
+                ESP_LOGI(UART, "GIMME A PIN: ");
+                state = HOUR;
+                continue;   // skip to next while loop iteration
+            }
+            else if(*RxdData == 'd') {
+                ESP_LOGI(UART, "GIMME A PIN: ");
+                state = DURATION;
+                continue;   // skip to next while loop iteration
             }
 
+            // Take user inputs
             switch(state) {
-                case 1: 
-                    ESP_LOGI(UART, "GIMME A PIN: ");
-                    state = 2;
-                    break;
-                case 2:
-                    // TODO set pin = data
+                ////// 's'
+                case HOUR:
+                    // set pin
+                    pin3Parameters.pin = (uint8_t)atoi(RxdData);
+                    // prompt hr
                     ESP_LOGI(UART, "GIMME A HR: ");
-                    state = 3;
+                    state = MIN;
                     break;
-                case 3:
-                    // TODO set hr = data
+                case MIN:
+                    // set hr
+                    pin3Parameters.scheduledTime.tm_hour = atoi(RxdData);
+                    // prompt min
                     ESP_LOGI(UART, "GIMME A MIN: ");
-                    state = 4;
+                    state = CONFIRM_TIME;
                     break;
-                case 4:
-                    // TODO set min = data
-                    ESP_LOGI(UART, "All done changing scheduled time");
+                case CONFIRM_TIME:
+                    // set min
+                    pin3Parameters.scheduledTime.tm_min = atoi(RxdData);
+                    // Convert tm info into H:M time format & print confirmation
+                    char timeStr[6];
+                    strftime(timeStr, sizeof(timeStr), "%H:%M", &pin3Parameters.scheduledTime);
+                    ESP_LOGI(UART, "You just changed the scheduled time for pin %hhu to %s",
+                                    pin3Parameters.pin, timeStr);
                     state = 0;
                     break;
+                //////
+                ////// 'd'
+                case DURATION:
+                    // set pin
+                    pin3Parameters.pin = (uint8_t)atoi(RxdData);
+                    // prompt duration
+                    ESP_LOGI(UART, "GIMME A DURATION (s): ");
+                    state = CONFIRM_DURATION;
+                    break;
+                case CONFIRM_DURATION:
+                    // set duration
+                    pin3Parameters.durationSec = (uint8_t)atoi(RxdData);
+                    // confirm choices
+                    ESP_LOGI(UART, "You just changed the duration for pin %hhu to %d seconds.",
+                                pin3Parameters.pin, pin3Parameters.durationSec);
+                    state = DEFAULT;
+                    break;
+                //////
+                //////
+                case DEFAULT:
                 default:
-                    state = 0;
-                    break;
-                case 0:
+                    state = DEFAULT;
                     break;
             }
 
@@ -277,7 +325,8 @@ void vRxTask() {
     }
 }
 
-// Task to turn on pump for water duration 5 sec at desired watering time.
+
+// Task to turn on pin for its duration.
 void vWaterTask(void* params) {
     waterTaskParams_t* p = (waterTaskParams_t*) params;
     TickType_t xPrevWakeTime = xTaskGetTickCount();
