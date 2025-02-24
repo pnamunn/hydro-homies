@@ -265,6 +265,9 @@ void vRxTask() {
             }
 
             // Take user inputs
+            // BUG flaws:   backspace not supported (will move on to next state)
+            //              if double digits not entered very quickly, will only get first digit
+            //              no error checking for entering letters instead of numbers
             switch(state) {
                 ////// 's'
                 case HOUR:
