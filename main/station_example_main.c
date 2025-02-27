@@ -16,11 +16,19 @@
 #include "driver/uart.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
+#include "esp_gatt_common_api.h"
+#include "esp_bt.h"
+#include "esp_bt_defs.h"
+#include "esp_bt_main.h"
+#include "esp_gap_ble_api.h"
+#include "esp_gatts_api.h"
 
-// Wifi menuconfigs
+/////////////// Menuconfigs (ESP-IDF Kconfigs) ////////////////
 #define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
 #define EXAMPLE_ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
 #define EXAMPLE_ESP_MAXIMUM_RETRY  4
+#define PARTITION_TABLE_TYPE CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE
+// TODO add rest of Kconfigs for BT & erase Kconfigs for Wifi that we don't need
 
 #if CONFIG_ESP_WPA3_SAE_PWE_HUNT_AND_PECK
 #define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_HUNT_AND_PECK
@@ -52,29 +60,44 @@
 
 #define WIFI_CONNECTED_BIT BIT0     // connected to AP & has an IP
 #define WIFI_FAIL_BIT      BIT1     // failed to connect
-static EventGroupHandle_t s_wifi_event_group;
-static int retry_count = 0;
+
+/////////////// end Menuconfigs (ESP-IDF Kconfigs) ////////////////
 
 
-// Logging
+////////////////// GLOBALS ////////////////////
+
+// Function Declarations //
+// TODO add rest of function declarations
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* params);
+static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_interface, esp_ble_gatts_cb_param_t* params);
+static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_interface, esp_ble_gatts_cb_param_t* params);
+static void gatts_profile_1_event_callback(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_interface, esp_ble_gatts_cb_param_t* params);
+
+// Logging //
 static const char* STA = "STA";
 static const char* NTP = "NTP";
 static const char* GPIO = "GPIO";
 static const char* UART = "UART";
+static const char* BLE = "BLE";
 
-// Globals
+// Wifi and NTP //
+static EventGroupHandle_t s_wifi_event_group;
+static int retry_count = 0;
 struct tm* localTime;
+
+// UART //
 const uart_port_t uart_num = UART_NUM_0;
 #define RX_BUFFER_SIZE 1024
 
+// GPIO //
 typedef struct waterTaskParams_t {
     uint8_t pin;
     uint8_t durationSec;
     struct tm scheduledTime;
 } waterTaskParams_t;
 
-struct waterTaskParams_t pin3Parameters = {.pin = 3, .durationSec = 5,
-                                            .scheduledTime.tm_hour = 22, .scheduledTime.tm_min = 30, .scheduledTime.tm_sec = 10};
+waterTaskParams_t pin3Parameters = {.pin = 3, .durationSec = 5,
+                                    .scheduledTime.tm_hour = 22, .scheduledTime.tm_min = 30, .scheduledTime.tm_sec = 10};
 
 enum AskState {
     DEFAULT,
@@ -89,8 +112,104 @@ enum AskState {
     CONFIRM_DURATION
 };
 
-static void wifi_connection_events_handler
-            (void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+
+// BLE GAP //
+
+// Advertisement service UUIDs (as big endian)
+static uint8_t adv_service_uuid128[32] = {
+    /* LSB <--------------------------------------------------------------------------------> MSB */
+    //first uuid, 16bit, [12],[13] is the value
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 
+    0xEE, 0x00,
+     0x00, 0x00,
+    //second uuid, 32bit, [12], [13], [14], [15] is the value
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 
+    0xFF, 0x00, 0x00, 0x00,
+};
+
+// Advertising Data Payload configs
+static esp_ble_adv_data_t advertising_data_payload_configs = {
+    .set_scan_rsp = false,  // is this not a Scan Response Payload
+    .include_name = true,   // advertise this ESP's name
+    .include_txpower = false,
+    .min_interval = 0x0006, // advertise the preferred connection min interval = val * 1.25 ms = 7.5 ms
+    .max_interval = 0x0010, // advertise the preferred connection max interval = val * 1.25 ms = 20 ms
+    .appearance = ESP_BLE_APPEARANCE_GENERIC_HEART_RATE,    // icon apperance on the central device
+    .p_manufacturer_data =  NULL,   // don't advertise manufacturer data
+    .manufacturer_len = 0,
+    .p_service_data = NULL, // don't advertise any service data
+    .service_data_len = 0,
+    .p_service_uuid = adv_service_uuid128,  // advertise this array of service uuids
+    .service_uuid_len = sizeof(adv_service_uuid128),
+    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT)    // bit field to set discovery settings
+};
+
+// Set advertising parameters
+static uint8_t advertising_done_flag = 0;
+static esp_ble_adv_params_t advertising_params = {
+    .adv_int_min = 0x0020,    // min interval = val * 0.625 ms = 20 ms
+    .adv_int_max = 0x0800,    // max interval = val * 0.625 ms = 1.28 sec
+    .adv_type = ADV_TYPE_IND,   // indication
+    .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+    .channel_map = ADV_CHNL_ALL,    // use all channels
+    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY, // allow scan response & connection response from any central peripheral (client)
+};
+
+
+// BLE GATT //
+
+// Struct to hold all info of a GATT Server Application Profile
+typedef struct gatts_profile_t {
+    esp_gatts_cb_t gatts_callback;
+    uint16_t gatts_interface;   // holds server-client interface type
+    uint16_t application_id;
+    uint16_t connection_id;
+    esp_gatt_srvc_id_t service_id;  // differentiates multiple services with the same UUID
+    esp_bt_uuid_t characteristic_uuid;
+    esp_gatt_char_prop_t characteristic_properties; // bit field to set flags
+    esp_bt_uuid_t characteristic_descriptor_uuid;
+    esp_gatt_perm_t attribute_permissions;
+    uint16_t service_handle;
+    uint16_t characteristic_handle;
+    uint16_t characteristic_descriptor_handle;   
+} gatts_profile_t;
+
+// The number of handles that are going to be needed to per service
+// Passed as a parameter to esp_ble_gatts_create_service()
+// Going to be 4 handles in a service:
+//      service handle, characteristic handle,
+//      characteristic data value handle, characteristic descriptor handle
+static const uint8_t NUM_HANDLES_PER_SERVICE = 4;
+
+// Create array of structs that holds the 2 GATT Server Profiles
+static gatts_profile_t gatts_profiles[2] = {
+    [0] = {
+        .gatts_callback = gatts_profile_0_event_callback,
+        .gatts_interface = ESP_GATT_IF_NONE, // profile not linked to any client type yet
+        },
+    [1] = {
+        .gatts_callback = gatts_profile_1_event_callback,
+        .gatts_interface = ESP_GATT_IF_NONE,
+        },
+};
+
+static uint8_t characteristic_data_value[] = {0x11,0x22,0x33};  // dummy data
+static esp_attr_value_t characteristic_data_value_handle = {
+    .attr_max_len = 0x40,
+    .attr_len     = sizeof(characteristic_data_value),
+    .attr_value   = characteristic_data_value,
+};
+
+
+////////////////// end GLOBALS ////////////////////
+
+
+
+
+static void wifi_connection_events_handler(void* arg,
+                                           esp_event_base_t event_base,
+                                           int32_t event_id,
+                                           void* event_data) {
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
     // if wifi has been started in station mode
@@ -113,7 +232,6 @@ static void wifi_connection_events_handler
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
-
 
 void init_wifi_STA(void) {
     s_wifi_event_group = xEventGroupCreate();
@@ -142,7 +260,6 @@ void init_wifi_STA(void) {
                                                         &wifi_connection_events_handler,
                                                         NULL,
                                                         &instance_got_ip));
-
 
     // set sta mode, configs, & start wifi
     wifi_config_t sta_configs = {
@@ -175,7 +292,6 @@ void init_wifi_STA(void) {
     }
 }
 
-
 void init_SNTP() {
     // set PST timezone
     char timezone[] = "PST8PDT";
@@ -190,7 +306,6 @@ void init_SNTP() {
     ESP_ERROR_CHECK(esp_netif_sntp_sync_wait(pdMS_TO_TICKS(15000))); // give 15 secs to attempt to connect to service
     ESP_LOGI(NTP, "Synced to SNTP service %s successfully!", ntp_server_address);
 }
-
 
 // Init GPIO pin to provide a pump signal.
 void initPump(uint32_t pinNum) {
@@ -210,7 +325,6 @@ bool isTimeMatch(struct tm scheduledTime) {
         return false;
     }
 }
-
 
 void initUART() {
     // set configs
@@ -234,6 +348,264 @@ void initUART() {
                                         0, NULL, 0));
     ESP_LOGI(UART, "UART initialized");
 }
+
+
+//////////////////// BLE ///////////////////////
+
+void init_BLE() {
+    // Free up the BSS (Bluetooth Simple Setup) & Classic BT data memory from the ESP's Bluetooth Controller, as you only plan to use BLE
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+
+    // Sse default configs for the ESP's Bluetooth Controller
+    esp_bt_controller_config_t bt_config = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_config));
+
+    // Set Bluetooth Controller to BLE mode
+    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
+
+    // use Bluedroid, a BT stack for Android
+    ESP_ERROR_CHECK(esp_bluedroid_init());
+    ESP_ERROR_CHECK(esp_bluedroid_enable());
+
+    // Tell ESP to use this callback to handle all GAP events
+    ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_event_handler));
+    // Tell ESP to use this callback to handle all GATT Server events
+    ESP_ERROR_CHECK(esp_ble_gatts_register_callback(gatts_event_handler));
+
+    // Creates 2 Application Profiles, so this GATT Server (the ESP) is able to handle 2 different types of clients
+    // Profiles' Application UUIDs are 0 and 1
+    ESP_ERROR_CHECK(esp_ble_gatts_app_register(0));
+    ESP_ERROR_CHECK(esp_ble_gatts_app_register(1));
+
+    // set max transmission unit (packet) size in bytes
+    ESP_ERROR_CHECK(esp_ble_gatt_set_local_mtu(512));
+
+    ESP_LOGI(BLE, "BLE initialized");
+}
+
+static void gap_event_handler(esp_gap_ble_cb_event_t event,
+                              esp_ble_gap_cb_param_t* params) {
+    switch(event) {
+        case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
+        // Triggered by: esp_ble_gatts_app_register(gap_event_handler) in init_BLE()
+            advertising_done_flag &= (~advertising_done_flag);
+            if(advertising_done_flag == 0) {
+                ESP_ERROR_CHECK(esp_ble_gap_start_advertising(&advertising_params));
+            }
+        break;
+
+        case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+        // Triggered by: esp_ble_gap_start_advertising() in ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT
+            // Just inform user that GAP advertising was successfully started
+            ESP_LOGI(BLE, "GAP advertising started.");
+        break;
+
+        case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+        // Triggered by: esp_ble_gap_update_conn_params() in ESP_GATTS_CONNECT_EVT
+            // just print the client-server connection's info
+            ESP_LOGI(BLE, "Client-Server BT connection established");
+        break;
+
+        default:
+        break;
+    }
+}
+
+/* Finds the appropriate GATT Server Profile & calls its event handling callback.
+If, however, no Profile exists yet for the detected server-client interface type
+(and we have room to create one more Profile), creates a Profile to support it. */
+static void gatts_event_handler(esp_gatts_cb_event_t event,
+                                esp_gatt_if_t gatts_interface,
+                                esp_ble_gatts_cb_param_t* params) {
+
+    // if given a GATTS register event, get its current server-client interface type
+    if(event == ESP_GATTS_REG_EVT) {
+        if(params->reg.status == ESP_GATT_OK) {
+            gatts_profiles[params->reg.app_id].gatts_interface = gatts_interface;
+        }
+        else {
+            ESP_LOGI(BLE, "GATTS registering failed for Profile %d", params->reg.app_id);
+            return;
+        }
+    }
+
+    // TODO why do while(0) here?
+    do {
+        // Go thru all gatts_profiles
+        for(int i=0; i < 2; i++) {
+            // Find the server-client interface type we want, if it exists already
+            // or the first profile not assigned a server-client interface yet
+            if( (gatts_interface == ESP_GATT_IF_NONE)
+             || (gatts_interface == gatts_profiles[i].gatts_interface) ) {
+                
+                // If the server-client interface we wanted exists,
+                // call its callback with the passed args
+                if(gatts_profiles[i].gatts_callback) {
+                    gatts_profiles[i].gatts_callback(event, gatts_interface, params);
+                }
+            }
+        }
+    }while(0);
+}
+
+/* Callback called when gatts_event_handler() detects a Profile 0 event.
+Sets GAP advertisement data, */ 
+static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
+                                          esp_gatt_if_t gatts_interface,
+                                          esp_ble_gatts_cb_param_t* params) {
+    switch(event) {
+        case ESP_GATTS_REG_EVT:
+        // Triggered by: esp_ble_gatts_app_register(gatts_event_handler) in init_BLE() (and directed to this call back thru gatts_event_handler())
+            // Create a service
+            gatts_profiles[0].service_id.is_primary = true; // this is a primary service, not a secondary
+            gatts_profiles[0].service_id.id.inst_id = 0x00; // instance ID
+            gatts_profiles[0].service_id.id.uuid.len = ESP_UUID_LEN_16; // UUID length
+            gatts_profiles[0].service_id.id.uuid.uuid.uuid16 = 0x00FF;   // UUID
+
+            // set device name, as it will show up on central devices
+            ESP_ERROR_CHECK(esp_ble_gap_set_device_name("ESP32 Hydro Homies BLE"));
+
+            // Set GAP Advertising Data Payload configs
+            ESP_ERROR_CHECK(esp_ble_gap_config_adv_data(&advertising_data_payload_configs));
+            advertising_done_flag |= (1 << 0);
+
+            ESP_ERROR_CHECK(esp_ble_gatts_create_service(gatts_interface, &gatts_profiles[0].service_id, NUM_HANDLES_PER_SERVICE));
+        break;
+
+        case ESP_GATTS_CREATE_EVT:
+        // Triggered by: esp_ble_gatts_create_service() in ESP_GATTS_REG_EVT
+            ESP_LOGI(BLE, "Service ID %d created",  gatts_profiles[0].service_id.id.uuid.uuid.uuid16);
+            gatts_profiles[0].service_handle = params->create.service_handle;
+            gatts_profiles[0].characteristic_uuid.len = ESP_UUID_LEN_16;
+            gatts_profiles[0].characteristic_uuid.uuid.uuid16 = 0xFF01;
+        
+            ESP_ERROR_CHECK(esp_ble_gatts_start_service(gatts_profiles[0].service_handle));
+
+            // Enable characteristic read, write, & notify properties (client is allowed to do these)
+            gatts_profiles[0].characteristic_properties = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+            
+            // Add Characteristic to the Service
+            ESP_ERROR_CHECK(esp_ble_gatts_add_char(gatts_profiles[0].service_handle,
+                                                   &gatts_profiles[0].characteristic_uuid,
+                                                   ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, // give Service permission to read & write this Characteristic
+                                                   gatts_profiles[0].characteristic_properties,
+                                                   &characteristic_data_value_handle, // give Characteristic this inital val
+                                                   ESP_GATT_RSP_BY_APP));  // no auto reponse to a client's requests to read or write this Characteristic
+        break;
+
+        case ESP_GATTS_ADD_CHAR_EVT:
+        // Triggered by: esp_ble_gatts_add_char() in ESP_GATTS_CREATE_EVT
+            gatts_profiles[0].characteristic_handle = params->add_char.attr_handle;
+            gatts_profiles[0].characteristic_descriptor_uuid.len = ESP_UUID_LEN_16;
+            // auto-generate a handle for the Characteristic Descriptor you're about to add
+            gatts_profiles[0].characteristic_descriptor_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+
+            uint16_t length = 0;
+            const uint8_t* attribute_value_payload;
+            // Grab Characteristic's length & payload, and store in length & *attribute_value_payload variables
+            ESP_ERROR_CHECK(esp_ble_gatts_get_attr_value(params->add_char.attr_handle,
+                                                         &length,
+                                                         &attribute_value_payload));
+
+            ESP_LOGI(BLE, "Characteristic payload = ");
+            for(int i=0; i < length; i++) {
+                ESP_LOGI(BLE, "%X", attribute_value_payload[i]);
+            }
+
+            // Add Characteristic Description to the Service
+            ESP_ERROR_CHECK(esp_ble_gatts_add_char_descr(gatts_profiles[0].service_handle,
+                                                         &gatts_profiles[0].characteristic_descriptor_uuid,
+                                                         ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, // give Service permission to read & write this Characteristic Description
+                                                         NULL,  // no inital value
+                                                         ESP_GATT_RSP_BY_APP)); // no auto reponse to a client's requests to read or write this Characteristic Description
+        break;
+
+        case ESP_GATTS_ADD_CHAR_DESCR_EVT:
+        // Triggered by: esp_ble_gatts_add_char_descr() in ESP_GATTS_ADD_CHAR_EVT
+            // just log a message
+            ESP_LOGI(BLE, "You added a characteristic & a characteristic description to the service.");
+            ESP_LOGI(BLE, "The characteristic's handle is %X", gatts_profiles[0].characteristic_handle);
+            ESP_LOGI(BLE, "And the characteristic descriptor's handle is %X", gatts_profiles[0].characteristic_descriptor_handle);
+        break;
+
+        case ESP_GATTS_START_EVT:
+        // Triggered by: esp_ble_gatts_start_service() in ESP_GATTS_CREATE_EVT
+
+        break;
+
+        case ESP_GATTS_CONNECT_EVT:
+        // Triggered by: a client connecting to the GATT Server
+            esp_ble_conn_update_params_t connection_parameters = {0};
+            connection_parameters.latency = 0;
+            connection_parameters.min_int = 0x10;    // val * 1.25 ms = 20 ms
+            connection_parameters.max_int = 0x30;   // val * 1.25 ms = 40 ms
+            connection_parameters.timeout = 400;    // val * 10 ms = 4,000 ms
+            // Copy params->connect.remote_bda to connection_parameters.bda
+            memcpy(connection_parameters.bda,   // bda = BT device addr
+                   params->connect.remote_bda,
+                   sizeof(esp_bd_addr_t));
+
+            gatts_profiles[0].connection_id = params->connect.conn_id;
+
+            ESP_LOGI(BLE, "Central device that just connected's BT addr is %02X:%02X:%02X:%02X:%02X:%02X",
+                                params->connect.remote_bda[0],
+                                params->connect.remote_bda[1],
+                                params->connect.remote_bda[2],
+                                params->connect.remote_bda[3],
+                                params->connect.remote_bda[4],
+                                params->connect.remote_bda[5]);
+
+            // Set connection parameters for the new server-client connection
+            ESP_ERROR_CHECK(esp_ble_gap_update_conn_params(&connection_parameters));
+        break;
+
+        case ESP_GATTS_READ_EVT:
+
+        break;
+
+        case ESP_GATTS_WRITE_EVT:
+
+        break;
+
+        case ESP_GATTS_EXEC_WRITE_EVT:
+
+        break;
+
+        case ESP_GATTS_MTU_EVT:
+
+        break;
+
+        case ESP_GATTS_UNREG_EVT:
+        case ESP_GATTS_ADD_INCL_SRVC_EVT:
+        case ESP_GATTS_DELETE_EVT:
+        case ESP_GATTS_STOP_EVT:
+        case ESP_GATTS_DISCONNECT_EVT:
+        case ESP_GATTS_OPEN_EVT:
+        case ESP_GATTS_CANCEL_OPEN_EVT:
+        case ESP_GATTS_CLOSE_EVT:
+        case ESP_GATTS_LISTEN_EVT:
+        case ESP_GATTS_CONGEST_EVT:
+        case ESP_GATTS_RESPONSE_EVT:
+        case ESP_GATTS_CREAT_ATTR_TAB_EVT:
+        case ESP_GATTS_SET_ATTR_VAL_EVT:
+        case ESP_GATTS_SEND_SERVICE_CHANGE_EVT:
+        case ESP_GATTS_CONF_EVT:
+
+        break;
+
+        default:
+        break;
+    }
+
+}
+
+static void gatts_profile_1_event_callback(esp_gatts_cb_event_t event,
+                                          esp_gatt_if_t gatts_interface,
+                                          esp_ble_gatts_cb_param_t* params) {
+
+}
+
+//////////////////// end BLE ///////////////////////
 
 
 void vRxTask() {
@@ -328,6 +700,11 @@ void vRxTask() {
     }
 }
 
+// Task to
+void vBLETask() {
+
+}
+
 
 // Task to turn on pin for its duration.
 void vWaterTask(void* params) {
@@ -385,6 +762,7 @@ void vPrintTimeTask(void* periodSec) {
 void app_main(void) 
 {
     // init NVS partition
+    // Non-Volatile Storage needed to hold Wifi SSID, password, and GATT 
     esp_err_t nvs_return_handle = nvs_flash_init();
     if (nvs_return_handle == ESP_ERR_NVS_NO_FREE_PAGES || nvs_return_handle == ESP_ERR_NVS_NEW_VERSION_FOUND) {
       ESP_ERROR_CHECK(nvs_flash_erase());
@@ -395,7 +773,9 @@ void app_main(void)
 
     init_wifi_STA();
     init_SNTP();
-    
+
+    init_BLE();
+
     // esp_err_t status_handle = esp_wifi_get_mode(WIFI_MODE_STA);
     // char* status_string[] = esp_err_to_name(status_handle);
 
@@ -426,6 +806,13 @@ void app_main(void)
                                    NULL, 2, NULL);
     if(taskCreateStatus == pdPASS) {
         ESP_LOGI(GPIO, "vRxTask() task creation successful");
+    }
+
+     // BLE Task
+    taskCreateStatus = xTaskCreate(vRxTask, "BLE task", 1024 * 4,
+                                   NULL, 2, NULL);
+    if(taskCreateStatus == pdPASS) {
+        ESP_LOGI(GPIO, "vBLETask() task creation successful");
     }
 
     // esp idf's task.h API automatically runs vTaskStartScheduler() at end of app_main()
