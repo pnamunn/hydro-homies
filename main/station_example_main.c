@@ -29,6 +29,7 @@
 #define EXAMPLE_ESP_MAXIMUM_RETRY  4
 #define PARTITION_TABLE_TYPE CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE
 // TODO add rest of Kconfigs for BT & erase Kconfigs for Wifi that we don't need
+#define LOG_DEFAULT_LEVEL CONFIG_LOG_DEFAULT_LEVEL_INFO
 
 #if CONFIG_ESP_WPA3_SAE_PWE_HUNT_AND_PECK
 #define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_HUNT_AND_PECK
@@ -79,6 +80,7 @@ static const char* NTP = "NTP";
 static const char* GPIO = "GPIO";
 static const char* UART = "UART";
 static const char* BLE = "BLE";
+// static const char* BLE_WARN = "BLE";
 
 // Wifi and NTP //
 static EventGroupHandle_t s_wifi_event_group;
@@ -193,12 +195,27 @@ static gatts_profile_t gatts_profiles[2] = {
         },
 };
 
+// static const esp_attr_control_t READ_AND_WRITE_AUTO_RESPONSE_SETTING = { 
+//     .auto_rsp = ESP_GATT_AUTO_RSP
+// };
+
+// Initial values being given the Characteristic & Characteristic Descriptor
 static uint8_t characteristic_data_value[] = {0x11,0x22,0x33};  // dummy data
+// static uint8_t characteristic_description_data_value[] ={0x44,0x55,0x66};  // dummy data
+
 static esp_attr_value_t characteristic_data_value_handle = {
     .attr_max_len = 0x40,
     .attr_len     = sizeof(characteristic_data_value),
-    .attr_value   = characteristic_data_value,
+    .attr_value   = characteristic_data_value
 };
+
+// static esp_attr_value_t characteristic_description_data_value_handle = {
+//     .attr_max_len = 0x40,
+//     .attr_len     = sizeof(characteristic_description_data_value),
+//     .attr_value   = characteristic_description_data_value
+// };
+
+static uint8_t read_response_value[] = {0xDE,0xED,0xBE,0xEF}; // dummy data
 
 
 ////////////////// end GLOBALS ////////////////////
@@ -353,6 +370,8 @@ void initUART() {
 //////////////////// BLE ///////////////////////
 
 void init_BLE() {
+    esp_log_level_set(BLE, ESP_LOG_INFO);
+
     // Free up the BSS (Bluetooth Simple Setup) & Classic BT data memory from the ESP's Bluetooth Controller, as you only plan to use BLE
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 
@@ -516,7 +535,7 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
             ESP_ERROR_CHECK(esp_ble_gatts_add_char_descr(gatts_profiles[0].service_handle,
                                                          &gatts_profiles[0].characteristic_descriptor_uuid,
                                                          ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, // give Service permission to read & write this Characteristic Description
-                                                         NULL,  // no inital value
+                                                         &characteristic_description_data_value_handle,  // give this initial value
                                                          ESP_GATT_RSP_BY_APP)); // no auto reponse to a client's requests to read or write this Characteristic Description
         break;
 
@@ -530,7 +549,7 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
 
         case ESP_GATTS_START_EVT:
         // Triggered by: esp_ble_gatts_start_service() in ESP_GATTS_CREATE_EVT
-
+            ESP_LOGI(BLE, "Service started, has handle %d", params->start.service_handle);
         break;
 
         case ESP_GATTS_CONNECT_EVT:
@@ -541,58 +560,187 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
             connection_parameters.max_int = 0x30;   // val * 1.25 ms = 40 ms
             connection_parameters.timeout = 400;    // val * 10 ms = 4,000 ms
             // Copy params->connect.remote_bda to connection_parameters.bda
-            memcpy(connection_parameters.bda,   // bda = BT device addr
+            memcpy(connection_parameters.bda,   // bda = BT Device Address
                    params->connect.remote_bda,
                    sizeof(esp_bd_addr_t));
 
             gatts_profiles[0].connection_id = params->connect.conn_id;
 
-            ESP_LOGI(BLE, "Central device that just connected's BT addr is %02X:%02X:%02X:%02X:%02X:%02X",
-                                params->connect.remote_bda[0],
-                                params->connect.remote_bda[1],
-                                params->connect.remote_bda[2],
-                                params->connect.remote_bda[3],
-                                params->connect.remote_bda[4],
-                                params->connect.remote_bda[5]);
+            ESP_LOGI(BLE, "Connection to a central device made. BDA (BT Device Address) is "ESP_BD_ADDR_STR"", ESP_BD_ADDR_HEX(params->connect.remote_bda));
 
             // Set connection parameters for the new server-client connection
             ESP_ERROR_CHECK(esp_ble_gap_update_conn_params(&connection_parameters));
         break;
 
         case ESP_GATTS_READ_EVT:
+        // Triggered by: client sent a Read Request (is trying to read an attribute (a Service, a Charcteristic, or a Characteristic Descriptor))
+            esp_gatt_rsp_t response = {0};
 
+            // TODO remove read_response_value dummy data & instead correctly send back the requested handle's value
+            response.attr_value.handle = params->read.handle;
+            response.attr_value.len = sizeof(read_response_value) / sizeof(uint8_t);
+            memcpy(response.attr_value.value, read_response_value, sizeof(read_response_value));
+
+
+            // TODO why notify/indicate switch happens after a write event and not a read event ????
+            
+            // Respond to client's Read Request by sending back that attribute's data (needed bc auto-response turned off for our attributes)
+            ESP_ERROR_CHECK(esp_ble_gatts_send_response(gatts_interface,
+                                                        params->read.conn_id,
+                                                        params->read.trans_id,
+                                                        ESP_GATT_OK,
+                                                        &response));
+        break;
+
+        case ESP_GATTS_RESPONSE_EVT:
+        // Triggered by: esp_ble_gatts_send_response() in ESP_GATTS_READ_EVT and ESP_GATTS_WRITE_EVT
+            // ESP_LOGI(BLE, "ESP just sent a Response in response to a client's Request");
         break;
 
         case ESP_GATTS_WRITE_EVT:
+        // Triggered by: client sent a type of Request related to writing
+
+            // To indicate what characteristic the client wants to write, it sends
+            // the characteristic descriptor's handle as write.handle
+            // & the characteristic's value & descriptor as write.value
+            
+            // ESP_LOGI(BLE, "Client wants to write Characteristic %d as the value = ");
+            // ESP_LOG_BUFFER_HEX(BLE, params->write.value, params->write.len);
+
+            // Client sent anything but a Write Prepare Request (sent a Write Request or Write Command)
+            if(params->write.is_prep == 0) {
+
+                if( (params->write.handle == gatts_profiles[0].characteristic_descriptor_handle)
+                && (params->write.len == 2) ) {
+                // Confirm there's a characteristic descriptor with that handle on the ESP
+                // and that the client sent a write.value of 16 bits
+
+                    // Grab the characteristic descriptor that the client sent
+                    uint8_t characteristic_properties_value = params->write.value[0];
+                    ESP_LOGI(BLE, "Write event's characteristic_properties_value is %d", characteristic_properties_value);
+
+                    // See if we need to send a Notification or an Indication
+                    switch(characteristic_properties_value) {   // is big endian
+                        case 0x01:  // Notify enabled
+                            if(gatts_profiles[0].characteristic_properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) {
+                            // Confirm that the characteristic has Notify enabled, like the client claimed
+                                uint8_t notify_data[15];
+                                // dummy data
+                                for(int i=0; i < sizeof(notify_data); i++) { notify_data[i] = i % 0xFF; }
+                                // send data once it's available
+                                ESP_ERROR_CHECK(esp_ble_gatts_send_indicate(gatts_interface,
+                                                                            params->write.conn_id,
+                                                                            gatts_profiles[0].characteristic_handle,
+                                                                            sizeof(notify_data),
+                                                                            notify_data,
+                                                                            false));
+                                ESP_LOGI(BLE, "Notification with data sent");
+                            }
+                        break;
+
+                        case 0x02:  // Indicate enabled
+                            if(gatts_profiles[0].characteristic_properties & ESP_GATT_CHAR_PROP_BIT_INDICATE) {
+                            // Confirm that the characteristic has Indicate enabled, like the client claimed
+                                uint8_t indicate_data[15];
+                                // dummy data
+                                for(int i=0; i < sizeof(indicate_data); i++) { indicate_data[i] = i % 0xFF; }
+                                // send data once it's available & require an acknowledgement back from the central device for receiving this data
+                                ESP_ERROR_CHECK(esp_ble_gatts_send_indicate(gatts_interface,
+                                                                            params->write.conn_id,
+                                                                            gatts_profiles[0].characteristic_handle,
+                                                                            sizeof(indicate_data),
+                                                                            indicate_data,
+                                                                            true));
+                            }
+                        break;
+
+                        case 0x00:
+                            ESP_LOGI(BLE, "Characteristic's notify & indicate properties are disabled. Sending no response to client.");
+
+                        default:
+                            ESP_LOGW(BLE, "Default reached in ESP_GATTS_WRITE_EVT's switch case.  Property given (%X) not supported.", characteristic_properties_value);
+                        break;
+                    }
+                }
+            }
+
+            else {
+                ESP_LOGW(BLE, "Client sent a Write Prepare.  Not supported by ESP_GATTS_WRITE_EVT right now");
+            }
+
+
+            // example_write_event_env():
+
+            // Client sent a Write Request
+            if(params->write.need_rsp && !params->write.is_prep) {
+                // Send response with no data back (need response bc auto-response disabled)
+                ESP_LOGI(BLE, "ESP just sent a response to the client's Write Request");
+                ESP_ERROR_CHECK(esp_ble_gatts_send_response(gatts_interface,
+                                                            params->write.conn_id,
+                                                            params->write.trans_id,
+                                                            ESP_GATT_OK,
+                                                            NULL));
+            }
+            // Client sent a Write Prepare, so need to prepare data & send a response
+            else if(params->write.need_rsp && params->write.is_prep) {
+                ESP_LOGW(BLE, "Client sent a Write Prepare, which is not supported by ESP_GATTS_WRITE_EVT right now");
+                // TODO if client wants to do a long write (write more than the MTU), need to write code here
+                // to prepare for it by creating a buffer, check some things, 
+                // write data to buffer, write buffer to characteristic, & then send a response
+            }
+            // Client sent a Write Command, so no response needed
+            else {  // !params->write.need_rsp && params->write.is_prep is anything
+                ESP_LOGW(BLE, "Client sent a Write Command to write to Attribute %d the value:", params->write.handle);
+                ESP_LOG_BUFFER_HEX(BLE, params->write.value, params->write.len);
+                // TODO add code here to change that attribute's value to be params->write.value
+                ESP_LOGW(BLE, "ESP fulfilled Write Command without a response");
+            }
 
         break;
 
         case ESP_GATTS_EXEC_WRITE_EVT:
+        // Triggered by: client sent an Execute Write Request (which they should send after we respond to their Prepare Write Request)
+        // Either confirm or cancel the long write procedure done in ESP_GATTS_WRITE_EVT 
+        break;
 
+        case ESP_GATTS_CONF_EVT:
+        // Triggered by: client sent an acknowledgement that it received an Indication msg (should happen after esp_ble_gatts_send_indicate(..., ..., ..., ..., ..., true))
+            if(params->conf.status == ESP_GATT_OK) {
+                ESP_LOGI(BLE, "Client sent an acknowledgment that it received attribute handle %d", params->conf.handle);
+                ESP_LOGI(BLE, "Acknowledgement value is ");
+                ESP_LOG_BUFFER_HEX(BLE, params->conf.value, params->conf.len);
+            }
+            else {
+                ESP_LOGI(BLE, "Client tried to send an acknowledgement, but the acknowledgement failed");
+            }
         break;
 
         case ESP_GATTS_MTU_EVT:
+        // Triggered by: client sends an MTU Config Request (happens during the connection establishment process if the client wants to make a change to the MTU size)
+            // TODO set the MTU to the max possible val that both devices can support
 
+        break;
+
+        case ESP_GATTS_DISCONNECT_EVT:
+        // Triggered by: client disconnecting
+            ESP_LOGI(BLE, "Disconnected from "ESP_BD_ADDR_STR" for %02X reason",
+                            ESP_BD_ADDR_HEX(params->disconnect.remote_bda),
+                            params->disconnect.reason);
+            ESP_ERROR_CHECK(esp_ble_gap_start_advertising(&advertising_params));
         break;
 
         case ESP_GATTS_UNREG_EVT:
         case ESP_GATTS_ADD_INCL_SRVC_EVT:
         case ESP_GATTS_DELETE_EVT:
         case ESP_GATTS_STOP_EVT:
-        case ESP_GATTS_DISCONNECT_EVT:
         case ESP_GATTS_OPEN_EVT:
         case ESP_GATTS_CANCEL_OPEN_EVT:
         case ESP_GATTS_CLOSE_EVT:
         case ESP_GATTS_LISTEN_EVT:
         case ESP_GATTS_CONGEST_EVT:
-        case ESP_GATTS_RESPONSE_EVT:
         case ESP_GATTS_CREAT_ATTR_TAB_EVT:
         case ESP_GATTS_SET_ATTR_VAL_EVT:
         case ESP_GATTS_SEND_SERVICE_CHANGE_EVT:
-        case ESP_GATTS_CONF_EVT:
-
-        break;
-
         default:
         break;
     }
