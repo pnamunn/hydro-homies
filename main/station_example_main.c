@@ -574,27 +574,55 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
 
         case ESP_GATTS_READ_EVT:
         // Triggered by: client sent a Read Request (is trying to read an attribute (a Service, a Charcteristic, or a Characteristic Descriptor))
-            esp_gatt_rsp_t response = {0};
+            // Retrieve attribute that client wants to read
+            esp_gatt_rsp_t retrieved_attribute = {0};
+            retrieved_attribute.attr_value.handle = params->read.handle;
 
-            // TODO remove read_response_value dummy data & instead correctly send back the requested handle's value
-            response.attr_value.handle = params->read.handle;
-            response.attr_value.len = sizeof(read_response_value) / sizeof(uint8_t);
-            memcpy(response.attr_value.value, read_response_value, sizeof(read_response_value));
+            // Array of pointers to attribute values
+            // TODO increase array size to hold more attributes
+            const uint8_t* attribute_value_ptrs_array[1] = {retrieved_attribute.attr_value.value};
+
+            // Pointer-to-pointer (pointer to a pointer element in the attribute_value_pointers_array)
+            // TODO have a table (struct) to associate an attribute handle with its value pointer (so we can do [handle] below)
+            const uint8_t** attribute_value_ptr_ptr = &attribute_value_ptrs_array[0];
+
+            // Get attribute at the given handle, then store its length in retrieved_attribute struct
+            // & store its value in attribute_value_ptr_ptr
+            esp_gatt_status_t read_return_status = 
+                    esp_ble_gatts_get_attr_value(params->read.handle,
+                                                 &retrieved_attribute.attr_value.len,
+                                                 attribute_value_ptr_ptr);
+            
+            // Copy over value stored at attribute_value_ptr_ptr to retrieved_atrribute struct
+            memcpy(&retrieved_attribute.attr_value.value, *attribute_value_ptr_ptr, retrieved_attribute.attr_value.len);
 
 
-            // TODO why notify/indicate switch happens after a write event and not a read event ????
+            // ESP_LOGI(BLE, "Retrieved value %#X (or %#X) from handle %#X", **attribute_value_ptr_ptr, *retrieved_attribute.attr_value.value, retrieved_attribute.attr_value.handle);
+            ESP_LOGI(BLE, "Retrieved value");
+            // ESP_LOG_BUFFER_HEX(BLE, *attribute_value_ptr_ptr, retrieved_attribute.attr_value.len);
+            // ESP_LOGI(BLE, "or");
+            ESP_LOG_BUFFER_HEX(BLE, retrieved_attribute.attr_value.value, retrieved_attribute.attr_value.len);
+            ESP_LOGI(BLE, "from handle");
+            ESP_LOG_BUFFER_HEX(BLE, &retrieved_attribute.attr_value.handle, sizeof(retrieved_attribute.attr_value.handle));
             
             // Respond to client's Read Request by sending back that attribute's data (needed bc auto-response turned off for our attributes)
             ESP_ERROR_CHECK(esp_ble_gatts_send_response(gatts_interface,
                                                         params->read.conn_id,
                                                         params->read.trans_id,
-                                                        ESP_GATT_OK,
-                                                        &response));
+                                                        read_return_status,
+                                                        &retrieved_attribute));
+            
+            // TODO why notify/indicate switch happens after a write event and not a read event ????
         break;
 
         case ESP_GATTS_RESPONSE_EVT:
         // Triggered by: esp_ble_gatts_send_response() in ESP_GATTS_READ_EVT and ESP_GATTS_WRITE_EVT
-            // ESP_LOGI(BLE, "ESP just sent a Response in response to a client's Request");
+            ESP_LOGI(BLE, "ESP just sent a Response msg in reaction to a client Request");
+        break;
+
+        case ESP_GATTS_SET_ATTR_VAL_EVT:
+        // Triggered by: esp_ble_gatts_set_attr_value() in
+            
         break;
 
         case ESP_GATTS_WRITE_EVT:
@@ -673,14 +701,21 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
 
             // Client sent a Write Request
             if(params->write.need_rsp && !params->write.is_prep) {
-                // Send response with no data back (need response bc auto-response disabled)
-                ESP_LOGI(BLE, "ESP just sent a response to the client's Write Request");
+
+                // Overwrite the attribute
+                ESP_ERROR_CHECK(esp_ble_gatts_set_attr_value(params->write.handle,
+                                                             params->write.len,
+                                                             params->write.value));
+                // Send response with no data back (response only needed here bc auto-response disabled)
                 ESP_ERROR_CHECK(esp_ble_gatts_send_response(gatts_interface,
                                                             params->write.conn_id,
                                                             params->write.trans_id,
                                                             ESP_GATT_OK,
                                                             NULL));
+                ESP_LOGI(BLE, "ESP fulfilled client's Write Request to write to handle %#X the value", params->write.handle);
+                ESP_LOG_BUFFER_HEX(BLE, params->write.value, params->write.len);
             }
+
             // Client sent a Write Prepare, so need to prepare data & send a response
             else if(params->write.need_rsp && params->write.is_prep) {
                 ESP_LOGW(BLE, "Client sent a Write Prepare, which is not supported by ESP_GATTS_WRITE_EVT right now");
@@ -688,9 +723,14 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
                 // to prepare for it by creating a buffer, check some things, 
                 // write data to buffer, write buffer to characteristic, & then send a response
             }
+
             // Client sent a Write Command, so no response needed
             else {  // !params->write.need_rsp && params->write.is_prep is anything
-                ESP_LOGW(BLE, "Client sent a Write Command to write to Attribute %d the value:", params->write.handle);
+                // Overwrite the attribute
+                ESP_ERROR_CHECK(esp_ble_gatts_set_attr_value(params->write.handle,
+                                                             params->write.len,
+                                                             params->write.value));
+                ESP_LOGW(BLE, "ESP fulfilled client's Write Command to write to handle %#X the value", params->write.handle);
                 ESP_LOG_BUFFER_HEX(BLE, params->write.value, params->write.len);
                 // TODO add code here to change that attribute's value to be params->write.value
                 ESP_LOGW(BLE, "ESP fulfilled Write Command without a response");
