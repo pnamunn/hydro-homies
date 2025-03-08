@@ -162,25 +162,24 @@ static esp_ble_adv_params_t advertising_params = {
 
 // Struct to hold all info of a GATT Server Application Profile
 typedef struct gatts_profile_t {
+    // Profile data
     esp_gatts_cb_t gatts_callback;
     uint16_t gatts_interface;   // holds server-client interface type
-    uint16_t application_id;
     uint16_t connection_id;
-    esp_gatt_srvc_id_t service_id;  // differentiates multiple services with the same UUID
+    // Attribute data
+    esp_gatt_srvc_id_t service_id;
     esp_bt_uuid_t characteristic_uuid;
+    esp_bt_uuid_t CCCD_uuid;
     esp_gatt_char_prop_t characteristic_properties; // bit field to set flags
-    esp_bt_uuid_t characteristic_descriptor_uuid;
-    esp_gatt_perm_t attribute_permissions;
     uint16_t service_handle;
     uint16_t characteristic_handle;
-    uint16_t characteristic_descriptor_handle;   
+    uint16_t CCCD_handle;   
 } gatts_profile_t;
 
 // The number of handles that are going to be needed to per service
 // Passed as a parameter to esp_ble_gatts_create_service()
-// Going to be 4 handles in a service:
-//      service handle, characteristic handle,
-//      characteristic data value handle, characteristic descriptor handle
+// 4 handles needed for 4 Attributes:
+//      Service Declaration, Characteristic Declaration, Characteristic Value, CCCD
 static const uint8_t NUM_HANDLES_PER_SERVICE = 4;
 
 // Create array of structs that holds the 2 GATT Server Profiles
@@ -195,32 +194,62 @@ static gatts_profile_t gatts_profiles[2] = {
         },
 };
 
-// static const esp_attr_control_t READ_AND_WRITE_AUTO_RESPONSE_SETTING = { 
-//     .auto_rsp = ESP_GATT_AUTO_RSP
+/* Used in ESP_GATTS_CREATE_EVT to take pin3Parameter's values & put them in a serialized packet so that they can be a Characteristic Value Attribute's value. */
+void packetize_params(const struct waterTaskParams_t* pinParameters, uint8_t* characteristic_value_variable, uint8_t length) {
+    uint8_t temp[length];
+    temp[0] = pinParameters->pin;
+    temp[1] = pinParameters->durationSec;
+    temp[2] = pinParameters->scheduledTime.tm_sec;
+    temp[3] = pinParameters->scheduledTime.tm_min;
+    temp[4] = pinParameters->scheduledTime.tm_hour;
+    temp[5] = pinParameters->scheduledTime.tm_mday;
+    temp[6] = pinParameters->scheduledTime.tm_mon;
+    temp[7] = pinParameters->scheduledTime.tm_wday;
+    temp[8] = pinParameters->scheduledTime.tm_isdst;
+
+    memcpy(characteristic_value_variable, temp, length);
+}
+
+/* Used in a ESP_GATTS_WRITE_EVT to take what the client Wrote & assign it to the pin3Parameters struct.
+If client does not give all 9 values, the ungiven index values will be written to 0. */
+void depacketize_params(struct waterTaskParams_t* pinParameters, uint8_t characteristic_value_variable[9], uint8_t length) {
+    pinParameters->pin = characteristic_value_variable[0];
+    pinParameters->durationSec = characteristic_value_variable[1];
+    pinParameters->scheduledTime.tm_sec = characteristic_value_variable[2];
+    pinParameters->scheduledTime.tm_min = characteristic_value_variable[3];
+    pinParameters->scheduledTime.tm_hour = characteristic_value_variable[4];
+    pinParameters->scheduledTime.tm_mday = characteristic_value_variable[5];
+    pinParameters->scheduledTime.tm_mon = characteristic_value_variable[6];
+    pinParameters->scheduledTime.tm_wday = characteristic_value_variable[7];
+    pinParameters->scheduledTime.tm_isdst = characteristic_value_variable[8];
+    ESP_LOGI(BLE, "pin3Parameters.pin = %d", pinParameters->pin);
+}
+
+// static uint8_t packaged_pin3Parameters[38] = {0};  // dummy data
+
+// static esp_attr_value_t characteristic_value = {
+//     .attr_max_len = 0x130,  // 304 b
+//     .attr_len     = sizeof(waterTaskParams_t),
+//     .attr_value   = packaged_pin3Parameters
 // };
 
-// Initial values being given the Characteristic & Characteristic Descriptor
-static uint8_t characteristic_data_value[] = {0x11,0x22,0x33};  // dummy data
-// static uint8_t characteristic_description_data_value[] ={0x44,0x55,0x66};  // dummy data
 
-static esp_attr_value_t characteristic_data_value_handle = {
-    .attr_max_len = 0x40,
-    .attr_len     = sizeof(characteristic_data_value),
-    .attr_value   = characteristic_data_value
+static uint8_t initial_characteristic_value_value[9] = {0};
+static esp_attr_value_t characteristic_value_value = {  // value of the Characteristic Value Attribute
+    .attr_max_len = 0x48,   // 8 b * 9 = 72 b
+    .attr_len     = sizeof(initial_characteristic_value_value),
+    .attr_value   = initial_characteristic_value_value
 };
 
-// static esp_attr_value_t characteristic_description_data_value_handle = {
-//     .attr_max_len = 0x40,
-//     .attr_len     = sizeof(characteristic_description_data_value),
-//     .attr_value   = characteristic_description_data_value
-// };
-
-static uint8_t read_response_value[] = {0xDE,0xED,0xBE,0xEF}; // dummy data
+static uint8_t initial_CCCD_value[] = {0x01};  // enable Notifications
+static esp_attr_value_t CCCD_value = {  // value of the CCCD Attribute
+    .attr_max_len = 0x08,
+    .attr_len     = sizeof(initial_CCCD_value),
+    .attr_value   = initial_CCCD_value
+};
 
 
 ////////////////// end GLOBALS ////////////////////
-
-
 
 
 static void wifi_connection_events_handler(void* arg,
@@ -421,8 +450,6 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event,
 
         case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
         // Triggered by: esp_ble_gap_update_conn_params() in ESP_GATTS_CONNECT_EVT
-            // just print the client-server connection's info
-            ESP_LOGI(BLE, "Client-Server BT connection established");
         break;
 
         default:
@@ -475,98 +502,112 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
     switch(event) {
         case ESP_GATTS_REG_EVT:
         // Triggered by: esp_ble_gatts_app_register(gatts_event_handler) in init_BLE() (and directed to this call back thru gatts_event_handler())
-            // Create a service
-            gatts_profiles[0].service_id.is_primary = true; // this is a primary service, not a secondary
-            gatts_profiles[0].service_id.id.inst_id = 0x00; // instance ID
-            gatts_profiles[0].service_id.id.uuid.len = ESP_UUID_LEN_16; // UUID length
-            gatts_profiles[0].service_id.id.uuid.uuid.uuid16 = 0x00FF;   // UUID
-
             // set device name, as it will show up on central devices
             ESP_ERROR_CHECK(esp_ble_gap_set_device_name("ESP32 Hydro Homies BLE"));
-
             // Set GAP Advertising Data Payload configs
             ESP_ERROR_CHECK(esp_ble_gap_config_adv_data(&advertising_data_payload_configs));
             advertising_done_flag |= (1 << 0);
 
+            // Then set up for the creation of the Service Declaration Attribute
+            gatts_profiles[0].service_id.is_primary = true; // this is a primary service, not a secondary
+            gatts_profiles[0].service_id.id.inst_id = 0x00A0; // arbitrary Service ID
+            gatts_profiles[0].service_id.id.uuid.len = ESP_UUID_LEN_16;
+            gatts_profiles[0].service_id.id.uuid.uuid.uuid16 = 0x2800;
+
+            // Create the Service
             ESP_ERROR_CHECK(esp_ble_gatts_create_service(gatts_interface, &gatts_profiles[0].service_id, NUM_HANDLES_PER_SERVICE));
         break;
 
         case ESP_GATTS_CREATE_EVT:
         // Triggered by: esp_ble_gatts_create_service() in ESP_GATTS_REG_EVT
-            ESP_LOGI(BLE, "Service ID %d created",  gatts_profiles[0].service_id.id.uuid.uuid.uuid16);
+            // assign the handle that the stack auto-generated for the Service Declaration Attribute
             gatts_profiles[0].service_handle = params->create.service_handle;
-            gatts_profiles[0].characteristic_uuid.len = ESP_UUID_LEN_16;
-            gatts_profiles[0].characteristic_uuid.uuid.uuid16 = 0xFF01;
-        
-            ESP_ERROR_CHECK(esp_ble_gatts_start_service(gatts_profiles[0].service_handle));
 
+            // Start the Service
+            ESP_ERROR_CHECK(esp_ble_gatts_start_service(gatts_profiles[0].service_handle));
+            ESP_LOGI(BLE, "You created & started a Service with handle %#04X", gatts_profiles[0].service_handle);
+
+            // Then set up for the creation of the Characteristic Value Attribute
+            gatts_profiles[0].characteristic_uuid.len = ESP_UUID_LEN_16;
+            gatts_profiles[0].characteristic_uuid.uuid.uuid16 = 0x00A1; // Characteristic Value UUID
+        
             // Enable characteristic read, write, & notify properties (client is allowed to do these)
             gatts_profiles[0].characteristic_properties = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
             
-            // Add Characteristic to the Service
+            // Put values in pin3Parameters struct into a serial packet in initial_characteristic_value_value
+            packetize_params(&pin3Parameters, &initial_characteristic_value_value[0], 9);
+
+            // Add Characteristic Value Attribute to the Service (by making a Chracteristic Declaration Attribute)
+            // & make its initial value initial_characteristic_value_value (which should now be the serialized packet of pin3Parameters values)
             ESP_ERROR_CHECK(esp_ble_gatts_add_char(gatts_profiles[0].service_handle,
                                                    &gatts_profiles[0].characteristic_uuid,
                                                    ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, // give Service permission to read & write this Characteristic
                                                    gatts_profiles[0].characteristic_properties,
-                                                   &characteristic_data_value_handle, // give Characteristic this inital val
-                                                   ESP_GATT_RSP_BY_APP));  // no auto reponse to a client's requests to read or write this Characteristic
+                                                   &characteristic_value_value, // give Characteristic this inital value
+                                                   ESP_GATT_RSP_BY_APP));  // no auto response to a client's requests to read or write this Characteristic (I have to create the responses myself)
         break;
 
         case ESP_GATTS_ADD_CHAR_EVT:
         // Triggered by: esp_ble_gatts_add_char() in ESP_GATTS_CREATE_EVT
+            // assign the handle that the stack auto-generated for the Characteristic Value Attribute
             gatts_profiles[0].characteristic_handle = params->add_char.attr_handle;
-            gatts_profiles[0].characteristic_descriptor_uuid.len = ESP_UUID_LEN_16;
-            // auto-generate a handle for the Characteristic Descriptor you're about to add
-            gatts_profiles[0].characteristic_descriptor_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
-
-            uint16_t length = 0;
-            const uint8_t* attribute_value_payload;
-            // Grab Characteristic's length & payload, and store in length & *attribute_value_payload variables
+            ESP_LOGI(BLE, "You added a Characteristic Value to the Service.");
+            ESP_LOGI(BLE, "The Characteristic Value's handle is %#04X", gatts_profiles[0].characteristic_handle);
+            uint16_t value_length = 0;
+            const uint8_t* value_payload;
+            // grab Characteristic Value's value length & value payload, and store in value_length & value_payload variables
             ESP_ERROR_CHECK(esp_ble_gatts_get_attr_value(params->add_char.attr_handle,
-                                                         &length,
-                                                         &attribute_value_payload));
+                                                         &value_length,
+                                                         &value_payload));
+            ESP_LOGI(BLE, "Characteristic Value's value payload = ");
+            ESP_LOG_BUFFER_HEX(BLE, value_payload, value_length);
 
-            ESP_LOGI(BLE, "Characteristic payload = ");
-            for(int i=0; i < length; i++) {
-                ESP_LOGI(BLE, "%X", attribute_value_payload[i]);
-            }
+            // Then set up for the creation of a CCCD
+            gatts_profiles[0].CCCD_uuid.len = ESP_UUID_LEN_16;
+            gatts_profiles[0].CCCD_uuid.uuid.uuid16 = 0x2902;
 
-            // Add Characteristic Description to the Service
+            // Add CCCD to the Service
             ESP_ERROR_CHECK(esp_ble_gatts_add_char_descr(gatts_profiles[0].service_handle,
-                                                         &gatts_profiles[0].characteristic_descriptor_uuid,
+                                                         &gatts_profiles[0].CCCD_uuid,
                                                          ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, // give Service permission to read & write this Characteristic Description
-                                                         &characteristic_description_data_value_handle,  // give this initial value
+                                                         &CCCD_value,  // give this initial value
                                                          ESP_GATT_RSP_BY_APP)); // no auto reponse to a client's requests to read or write this Characteristic Description
         break;
 
         case ESP_GATTS_ADD_CHAR_DESCR_EVT:
         // Triggered by: esp_ble_gatts_add_char_descr() in ESP_GATTS_ADD_CHAR_EVT
             // just log a message
-            ESP_LOGI(BLE, "You added a characteristic & a characteristic description to the service.");
-            ESP_LOGI(BLE, "The characteristic's handle is %X", gatts_profiles[0].characteristic_handle);
-            ESP_LOGI(BLE, "And the characteristic descriptor's handle is %X", gatts_profiles[0].characteristic_descriptor_handle);
+            gatts_profiles[0].CCCD_handle = params->add_char_descr.attr_handle;
+            ESP_LOGI(BLE, "You added a CCCD to the Service.");
+            ESP_LOGI(BLE, "The CCCD's handle is %#04X and its value =", gatts_profiles[0].CCCD_handle);
+            value_length = 0;
+            value_payload = 0;
+            // grab CCCD's value length & value payload, and store in value_length & value_payload variables
+            ESP_ERROR_CHECK(esp_ble_gatts_get_attr_value(params->add_char_descr.attr_handle,
+                                                         &value_length,
+                                                         &value_payload));
+            ESP_LOG_BUFFER_HEX(BLE, value_payload, value_length);
         break;
 
         case ESP_GATTS_START_EVT:
         // Triggered by: esp_ble_gatts_start_service() in ESP_GATTS_CREATE_EVT
-            ESP_LOGI(BLE, "Service started, has handle %d", params->start.service_handle);
+            ESP_LOGI(BLE, "Service started, has handle %#02X", params->start.service_handle);
         break;
 
         case ESP_GATTS_CONNECT_EVT:
         // Triggered by: a client connecting to the GATT Server
+            ESP_LOGI(BLE, "Connection to a central device made. BDA (BT Device Address) is "ESP_BD_ADDR_STR"", ESP_BD_ADDR_HEX(params->connect.remote_bda));
+
             esp_ble_conn_update_params_t connection_parameters = {0};
             connection_parameters.latency = 0;
             connection_parameters.min_int = 0x10;    // val * 1.25 ms = 20 ms
             connection_parameters.max_int = 0x30;   // val * 1.25 ms = 40 ms
             connection_parameters.timeout = 400;    // val * 10 ms = 4,000 ms
-            // Copy params->connect.remote_bda to connection_parameters.bda
+            // copy params->connect.remote_bda to connection_parameters.bda
             memcpy(connection_parameters.bda,   // bda = BT Device Address
                    params->connect.remote_bda,
                    sizeof(esp_bd_addr_t));
-
             gatts_profiles[0].connection_id = params->connect.conn_id;
-
-            ESP_LOGI(BLE, "Connection to a central device made. BDA (BT Device Address) is "ESP_BD_ADDR_STR"", ESP_BD_ADDR_HEX(params->connect.remote_bda));
 
             // Set connection parameters for the new server-client connection
             ESP_ERROR_CHECK(esp_ble_gap_update_conn_params(&connection_parameters));
@@ -617,7 +658,7 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
 
         case ESP_GATTS_RESPONSE_EVT:
         // Triggered by: esp_ble_gatts_send_response() in ESP_GATTS_READ_EVT and ESP_GATTS_WRITE_EVT
-            ESP_LOGI(BLE, "ESP just sent a Response msg in reaction to a client Request");
+            ESP_LOGI(BLE, "Response just sent to a client Request");
         break;
 
         case ESP_GATTS_SET_ATTR_VAL_EVT:
@@ -627,28 +668,24 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
 
         case ESP_GATTS_WRITE_EVT:
         // Triggered by: client sent a type of Request related to writing
-
-            // To indicate what characteristic the client wants to write, it sends
-            // the characteristic descriptor's handle as write.handle
-            // & the characteristic's value & descriptor as write.value
-            
-            // ESP_LOGI(BLE, "Client wants to write Characteristic %d as the value = ");
-            // ESP_LOG_BUFFER_HEX(BLE, params->write.value, params->write.len);
+            /* To indicate what characteristic the client wants to write, it sends
+            the characteristic descriptor's handle as write.handle
+            & the characteristic's value & descriptor as write.value */
 
             // Client sent anything but a Write Prepare Request (sent a Write Request or Write Command)
             if(params->write.is_prep == 0) {
 
-                if( (params->write.handle == gatts_profiles[0].characteristic_descriptor_handle)
+                if( (params->write.handle == gatts_profiles[0].CCCD_handle)
                 && (params->write.len == 2) ) {
                 // Confirm there's a characteristic descriptor with that handle on the ESP
                 // and that the client sent a write.value of 16 bits
 
-                    // Grab the characteristic descriptor that the client sent
-                    uint8_t characteristic_properties_value = params->write.value[0];
-                    ESP_LOGI(BLE, "Write event's characteristic_properties_value is %d", characteristic_properties_value);
+                    // Grab the CCCD value that the client sent
+                    uint8_t CCCD_value_from_client = params->write.value[0];
+                    ESP_LOGI(BLE, "Write event's CCCD_value_from_client is %d", CCCD_value_from_client);
 
                     // See if we need to send a Notification or an Indication
-                    switch(characteristic_properties_value) {   // is big endian
+                    switch(CCCD_value_from_client) {
                         case 0x01:  // Notify enabled
                             if(gatts_profiles[0].characteristic_properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) {
                             // Confirm that the characteristic has Notify enabled, like the client claimed
@@ -686,7 +723,7 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
                             ESP_LOGI(BLE, "Characteristic's notify & indicate properties are disabled. Sending no response to client.");
 
                         default:
-                            ESP_LOGW(BLE, "Default reached in ESP_GATTS_WRITE_EVT's switch case.  Property given (%X) not supported.", characteristic_properties_value);
+                            ESP_LOGW(BLE, "Default reached in ESP_GATTS_WRITE_EVT's switch case.  Property given (%X) not supported.", CCCD_value_from_client);
                         break;
                     }
                 }
@@ -701,11 +738,13 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
 
             // Client sent a Write Request
             if(params->write.need_rsp && !params->write.is_prep) {
-
                 // Overwrite the attribute
                 ESP_ERROR_CHECK(esp_ble_gatts_set_attr_value(params->write.handle,
                                                              params->write.len,
                                                              params->write.value));
+                // Assign client's data to pin3Parameters
+                depacketize_params(&pin3Parameters, params->write.value, params->write.len);
+
                 // Send response with no data back (response only needed here bc auto-response disabled)
                 ESP_ERROR_CHECK(esp_ble_gatts_send_response(gatts_interface,
                                                             params->write.conn_id,
@@ -726,14 +765,16 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
 
             // Client sent a Write Command, so no response needed
             else {  // !params->write.need_rsp && params->write.is_prep is anything
+                ESP_LOGW(BLE, "params->write.len = %d", params->write.len);
                 // Overwrite the attribute
                 ESP_ERROR_CHECK(esp_ble_gatts_set_attr_value(params->write.handle,
                                                              params->write.len,
                                                              params->write.value));
+                // Assign client's data to pin3Parameters
+                depacketize_params(&pin3Parameters, params->write.value, params->write.len);
+                
                 ESP_LOGW(BLE, "ESP fulfilled client's Write Command to write to handle %#X the value", params->write.handle);
                 ESP_LOG_BUFFER_HEX(BLE, params->write.value, params->write.len);
-                // TODO add code here to change that attribute's value to be params->write.value
-                ESP_LOGW(BLE, "ESP fulfilled Write Command without a response");
             }
 
         break;
@@ -779,7 +820,6 @@ static void gatts_profile_0_event_callback(esp_gatts_cb_event_t event,
         case ESP_GATTS_LISTEN_EVT:
         case ESP_GATTS_CONGEST_EVT:
         case ESP_GATTS_CREAT_ATTR_TAB_EVT:
-        case ESP_GATTS_SET_ATTR_VAL_EVT:
         case ESP_GATTS_SEND_SERVICE_CHANGE_EVT:
         default:
         break;
